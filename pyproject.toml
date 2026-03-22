@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windows-ddc"
+version = "0.1.0"
+description = "Windows DDC monitor volume controller with tray and overlay UI."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "monitorcontrol==4.2.0",
+]
+
+[project.optional-dependencies]
+build = [
+    "Nuitka==2.4.8",
+]
+
+[tool.setuptools]
+py-modules = [
+    "app",
+    "gui",
+    "ddc",
+    "settings",
+    "theme",
+    "overlay",
+    "windows_platform",
+]
