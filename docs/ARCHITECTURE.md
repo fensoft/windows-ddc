@@ -7,7 +7,7 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 ## High-level flow
 
 1. The supported entrypoint, `app.py`, creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()`.
-2. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference and loads a saved monitor selection from `settings.py`.
+2. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference and loads the saved monitor selection and Change speed preference from `settings.py`.
 3. It builds the fixed-size control window, status bar, and hidden `overlay.VolumeOverlay` on the Tk thread.
 4. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
 5. It independently starts the tray controller and global keyboard hook. Their failures remain nonfatal to the other subsystems.
@@ -68,7 +68,7 @@ Keeping composition here makes `gui.py` responsible for application behavior wit
 | `app.py` | Creates and runs the application. |
 | `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, persistence calls, tray lifecycle, and shutdown. |
 | `ddc.py` | Defines `MonitorRef`, selection identity, monitor discovery, clamping, and DDC read/change/write wrappers. |
-| `settings.py` | Loads and replaces the selected-monitor JSON file. |
+| `settings.py` | Atomically loads and replaces the selected-monitor and Change speed JSON settings. |
 | `overlay.py` | Implements topmost transient volume and unavailable/error presentations. |
 | `theme.py` | Samples the Windows theme, defines ttk dark styling, applies DWM dark chrome, and resolves the icon. |
 | `windows_platform.py` | Declares the Win32 ctypes ABI and implements monitor identity/EDID inventory, display notifications, tray, keyboard-hook, and DWM helpers. |
@@ -156,7 +156,7 @@ The callback passes unrelated keys directly to `CallNextHookEx`. It recognizes o
 - `VK_VOLUME_DOWN` (`0xAE`)
 - `VK_VOLUME_UP` (`0xAF`)
 
-When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys pass onward. If a previously configured target is unavailable, the first key-down in that invalid period also queues an error overlay without consuming the event. The notice is latched until readiness is restored or a new invalidation begins. On a consumed press, repeated key-down and matching key-up retain the initial consume decision; readiness loss stops new deltas but does not split a press between the app and Windows. The hook's step value is updated through a lock-protected setter when Tk handles the `+1`/`+2`/`+3` selector event, so the native thread never reads Tk state. The mute key is not recognized.
+When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys pass onward. If a previously configured target is unavailable, the first key-down in that invalid period also queues an error overlay without consuming the event. The notice is latched until readiness is restored or a new invalidation begins. On a consumed press, repeated key-down and matching key-up retain the initial consume decision; readiness loss stops new deltas but does not split a press between the app and Windows. The hook's numeric step is updated through a lock-protected setter when Tk handles the persistent Slow (`+1`), Medium (`+2`), or Fast (`+3`) Change speed event, so the native thread never reads Tk state. The mute key is not recognized.
 
 The callback does not inspect the `KBDLLHOOKSTRUCT.flags` injection bits. Synthesized Volume Down/Up events are therefore handled like physical-key events.
 
@@ -204,7 +204,7 @@ The control window is a non-resizable Tk/ttk layout at least 520 pixels wide so 
 - a read-only monitor combobox;
 - Refresh;
 - a `0`–`100` scale;
-- a non-persistent `+1`/`+2`/`+3` step selector and decrement/increment buttons;
+- a persistent Slow/Medium/Fast Change speed selector and decrement/increment buttons;
 - a percentage label and status bar.
 
 Widget state derives from `_busy`, monitor availability, confirmed volume, display-listener liveness, and topology validity. During a valid active write the volume controls remain enabled so a new last target can be queued.
@@ -219,7 +219,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTh
 
 Only a DWORD value of `0` selects dark mode. The preference is sampled once at startup. Dark mode creates a custom ttk theme and tries DWM attributes `20` then `19`; light mode prefers `vista`, `xpnative`, then `winnative` when available. The registry is read-only.
 
-The manually maintained screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). They predate the wider identity selector and error presentation; there is no automated screenshot workflow, so updates require real scrubbed captures.
+The manually maintained screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). They predate the wider identity selector, Change speed selector, and error presentation; there is no automated screenshot workflow, so updates require real scrubbed captures.
 
 ## Persistent data and filesystem ownership
 
@@ -240,6 +240,7 @@ It inherits the current user's filesystem permissions. The schema is:
 ```json
 {
   "schema_version": 2,
+  "change_speed": "medium",
   "selected_monitor": {
     "description": "physical monitor description",
     "identity": {
@@ -252,15 +253,15 @@ It inherits the current user's filesystem permissions. The schema is:
 }
 ```
 
-`save_selected_monitor_key()` requires a stable identity, creates the parent directories, writes indented UTF-8 JSON to sibling `settings.tmp`, and replaces `settings.json`. This reduces exposure to a partial destination but does not coordinate multiple processes; instances share both paths. Persistence failure is not visible in the status bar.
+`save_selected_monitor_key()` requires a stable identity and preserves a valid Change speed. `save_change_speed()` normalizes its value and preserves current schema-v2 or legacy monitor-selection data. Both create the parent directories, write indented UTF-8 JSON to sibling `settings.tmp`, and replace `settings.json`. This reduces exposure to a partial destination but does not coordinate multiple processes; instances share both paths. Persistence failure is not visible in the status bar.
 
-The writer emits schema version 2. The loader accepts the old unversioned description/ordinal shape for safe one-time promotion, rejects boolean ordinals, and treats missing files, I/O failures, invalid JSON, non-object roots, unknown versions, and invalid nested data as no selection.
+The monitor-selection writer emits schema version 2. Its loader accepts the old unversioned description/ordinal shape for safe one-time promotion, rejects boolean ordinals, and treats missing files, I/O failures, invalid JSON, non-object roots, unknown versions, and invalid nested data as no selection. Change speed is an independent top-level preference: missing or invalid values default to `slow`, and valid values are `slow`, `medium`, and `fast`.
 
 The monitor's actual volume is external mutable hardware state, not app storage. The app reads it after discovery or selection and never backs it up or restores it on exit.
 
 ### Backup and restore format
 
-Backup is a plain copy of `settings.json` while all instances are stopped. Restore is replacement with a UTF-8 JSON object matching the schema above. Moving the file aside resets only saved selection. There is no archive, database dump, encryption, integrity marker, or built-in backup command.
+Backup is a plain copy of `settings.json` while all instances are stopped. Restore is replacement with a UTF-8 JSON object matching the schema above. Moving the file aside resets saved selection and Change speed. There is no archive, database dump, encryption, integrity marker, or built-in backup command.
 
 Tests must replace `settings.SETTINGS_PATH` with a unique temporary path. They must not redirect or mutate a user's live app-data directory.
 
@@ -338,11 +339,11 @@ Known failure-state caveats include:
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, topology generations, display-message routing, fresh-wrapper writes, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, and shutdown diagnostics. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, topology generations, display-message routing, fresh-wrapper writes, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, and shutdown diagnostics. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 
-An authorized manual Windows/hardware pass is required for changes to discovery, selection, DDC I/O, key interception, tray lifecycle, theme/chrome, overlay, or shutdown. Tests of settings code must patch `SETTINGS_PATH` to a temporary location. Pure DDC wrapper tests should use fake context-manager monitor objects.
+An authorized manual Windows/hardware pass is required for changes to discovery, selection, DDC I/O, key interception, Change speed, tray lifecycle, theme/chrome, overlay, or shutdown. Tests of settings code must patch `SETTINGS_PATH` to a temporary location. Pure DDC wrapper tests should use fake context-manager monitor objects.
 
 ## Things to preserve
 

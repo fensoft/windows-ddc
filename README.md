@@ -14,13 +14,13 @@ It controls the monitor's DDC/CI audio-volume value, not the Windows audio mixer
 
 ![On-screen monitor volume overlay](docs/overlay.png)
 
-These manually maintained captures predate the wider serial-bearing monitor selector, volume-step selector, and unavailable/error overlay. Update them only from a real application capture on compatible hardware.
+These manually maintained captures predate the wider serial-bearing monitor selector, Change speed selector, and unavailable/error overlay. Update them only from a real application capture on compatible hardware.
 
 ## Features
 
 - Discovers DDC/CI monitors and lets the user select one target.
 - Reads and writes the selected monitor's volume in the `0`–`100` range.
-- Provides a slider and `-`/`+` buttons with selectable `+1`, `+2`, or `+3` steps.
+- Provides a slider and `-`/`+` buttons with a persistent Slow, Medium, or Fast change speed.
 - Intercepts the global Windows Volume Down and Volume Up keys only while the native hook is live and a target is ready.
 - Shows volume and fail-closed monitor errors in a bottom-centered, best-effort topmost overlay.
 - Starts in the Windows notification area only after Windows confirms the icon was added, with Restore and Exit actions plus Explorer-restart recovery.
@@ -102,7 +102,7 @@ With no saved selection, the app selects automatically only when exactly one ver
 | Start | Creates display-change, tray, and keyboard-hook threads with two-second startup deadlines, waits up to two seconds for confirmed tray-icon addition before hiding, then discovers monitors in the background. |
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
-| Change volume | Choose a `+1`, `+2`, or `+3` step, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
+| Change volume | Choose a Slow (`+1`), Medium (`+2`), or Fast (`+3`) change speed, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
 | Refresh | Re-enumerates monitors and reads the exact saved selection again. It never falls back to a different monitor. |
 | Minimize | Sends the control window to the notification area only after confirmed icon addition; failure restores the normal window. |
 | Close the restored window | Exits the application; it does not merely hide the window. |
@@ -110,7 +110,7 @@ With no saved selection, the app selects automatically only when exactly one ver
 
 Monitor discovery is event-driven rather than periodic. Windows display and monitor-device notifications immediately suspend control and schedule a debounced refresh with bounded retries. The displayed volume is not polled for changes made by another program or the monitor's OSD.
 
-The volume step defaults to `+1` on every launch. The selected step applies to both the on-screen `-`/`+` buttons and the global Volume Down/Up keys; it is not saved in `settings.json`.
+Change speed defaults to Slow (`+1`) when no valid preference is saved. Medium changes by `2` and Fast changes by `3`. The selected speed applies to both the on-screen `-`/`+` buttons and the global Volume Down/Up keys, updates the live hook immediately, and is saved in `settings.json`.
 
 A DDC write and its readback are not transactional. If the write succeeds but readback fails, or if the display changes during an in-flight call, the monitor may already have changed. The application reports that uncertainty in the overlay and status bar, replaces the displayed value with `--`, releases global key interception, and performs read-only rediscovery without retrying the write. Volume changes are not rolled back when the application exits.
 
@@ -146,6 +146,7 @@ There are no application-specific environment variables, CLI flags, environment 
 | --- | --- | --- |
 | `APPDATA` | If unset or empty, `Path.home()` | Base directory for the `windows-ddc` settings folder. |
 | `schema_version` | `2` for newly written settings | Selects the stable-identity settings schema. |
+| `change_speed` | `slow` | Persistent `slow` (`+1`), `medium` (`+2`), or `fast` (`+3`) volume-change preference. |
 | `selected_monitor.description` | No saved value | Human-readable description; used for safe migration of unique legacy selections. |
 | `selected_monitor.identity.device_path` | No saved value | Case-insensitive Windows monitor interface path and fallback identity. |
 | Optional EDID identity fields | Omitted when unavailable | Manufacturer ID, product code, and normalized serial used as the preferred identity. |
@@ -167,6 +168,7 @@ The exact schema is:
 ```json
 {
   "schema_version": 2,
+  "change_speed": "medium",
   "selected_monitor": {
     "description": "Monitor description",
     "identity": {
@@ -183,9 +185,9 @@ Writes go to sibling `settings.tmp` first and then replace `settings.json`. Ther
 
 Legacy description/ordinal files remain readable. A legacy selection is promoted to version 2 only when its description identifies exactly one verifiable current monitor; duplicate legacy descriptions fail closed and require manual selection.
 
-Missing, unreadable, syntactically invalid, non-object, unknown-version, or invalid nested settings are treated as no selection. JSON booleans are not accepted as legacy ordinals.
+Missing, unreadable, syntactically invalid, non-object, unknown-version, or invalid nested monitor settings are treated as no selection. JSON booleans are not accepted as legacy ordinals. A missing or invalid `change_speed` independently defaults to `slow`.
 
-The settings file contains monitor selection only, not volume, credentials, or secrets. The actual volume is monitor hardware state and is read again at startup.
+The settings file contains monitor selection and change-speed preference, not volume, credentials, or secrets. The actual volume is monitor hardware state and is read again at startup.
 
 ## Backup and restore
 
@@ -204,7 +206,7 @@ New-Item -ItemType Directory -Force -Path "$env:APPDATA\windows-ddc" | Out-Null
 Copy-Item -LiteralPath $backupPath -Destination "$env:APPDATA\windows-ddc\settings.json" -Force
 ```
 
-Choose another user-controlled backup location outside the checkout if Documents is unsuitable, and never commit the backup. If `APPDATA` is unset, substitute the fallback path documented above. Moving `settings.json` aside resets monitor selection on the next launch; it does not reset monitor volume.
+Choose another user-controlled backup location outside the checkout if Documents is unsuitable, and never commit the backup. If `APPDATA` is unset, substitute the fallback path documented above. Moving `settings.json` aside resets monitor selection and Change speed to its Slow default on the next launch; it does not reset monitor volume.
 
 ## Interfaces and security boundaries
 
@@ -252,7 +254,7 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated settings, topology generations, fresh-handle revalidation, and tray recovery. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, topology generations, fresh-handle revalidation, resilience, and tray recovery. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -276,7 +278,7 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 ```
 
-Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify unique/no-serial/duplicate identity behavior, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
+Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 
@@ -298,6 +300,7 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | The selected monitor is missing or ambiguous | The app will not choose another monitor. Reconnect it or explicitly select the intended target. |
 | The displayed value is stale | Choose **Refresh** after changes made by the monitor OSD or another tool. Display topology changes refresh automatically, but external volume is not polled. |
 | Selection is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Save errors are not surfaced. |
+| Change speed is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Invalid values safely fall back to Slow. |
 | Selection is lost after moving a no-serial monitor | Its Windows device path changed. Select it again so schema version 2 records the new path. |
 | Build fails before compilation | Install `.[build]`, ensure `python` resolves on `PATH`, and keep `app.py` and `windows-ddc.ico` at the repository root. |
 

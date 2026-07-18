@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from ddc import MonitorIdentity, SavedMonitorSelection
 from gui import MonitorVolumeApp
@@ -90,18 +90,22 @@ class MonitorVolumeAppHotkeyTests(unittest.TestCase):
         listener.is_active = False
         self.assertFalse(app._should_consume_volume_keys())
 
-    def test_step_selector_updates_the_app_and_live_listener(self) -> None:
+    def test_change_speed_updates_persistence_and_the_live_listener(self) -> None:
         app = MonitorVolumeApp.__new__(MonitorVolumeApp)
+        app.change_speed = "slow"
         app.volume_step = 1
-        app.volume_step_var = Mock()
-        app.volume_step_var.get.return_value = "+3"
+        app.change_speed_var = Mock()
+        app.change_speed_var.get.return_value = "Fast"
         app._listener = Mock()
 
-        app.on_volume_step_selected()
+        with patch("gui.save_change_speed") as save_mock:
+            app.on_change_speed_selected()
 
+        self.assertEqual(app.change_speed, "fast")
         self.assertEqual(app.volume_step, 3)
-        app.volume_step_var.set.assert_called_once_with("+3")
+        app.change_speed_var.set.assert_called_once_with("Fast")
         app._listener.set_step.assert_called_once_with(3)
+        save_mock.assert_called_once_with("fast")
 
     def test_write_failure_marks_volume_unknown_and_releases_hotkeys(self) -> None:
         app = self.make_ready_app(ListenerState(is_active=True))

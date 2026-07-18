@@ -194,6 +194,53 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.load_selected_monitor_key(), selection)
         payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["change_speed"], "slow")
+
+    def test_change_speed_round_trip_preserves_monitor_selection(self) -> None:
+        selection = SavedMonitorSelection(
+            description="Monitor",
+            identity=MonitorIdentity("device-path", "DEL", 0x1234, "SERIAL-A"),
+        )
+        settings.save_selected_monitor_key(selection)
+
+        settings.save_change_speed("Medium")
+
+        self.assertEqual(settings.load_change_speed(), "medium")
+        self.assertEqual(settings.load_selected_monitor_key(), selection)
+
+        settings.save_change_speed("fast")
+        settings.save_selected_monitor_key(selection)
+        self.assertEqual(settings.load_change_speed(), "fast")
+
+    def test_change_speed_can_be_saved_before_monitor_selection(self) -> None:
+        settings.save_change_speed("medium")
+
+        self.assertEqual(settings.load_change_speed(), "medium")
+        self.assertIsNone(settings.load_selected_monitor_key())
+        payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload, {"schema_version": 2, "change_speed": "medium"})
+
+    def test_change_speed_preserves_legacy_selection(self) -> None:
+        self.write_json({"selected_monitor": {"description": "Monitor", "ordinal": 2}})
+
+        settings.save_change_speed("fast")
+
+        self.assertEqual(settings.load_change_speed(), "fast")
+        self.assertEqual(
+            settings.load_selected_monitor_key(),
+            SavedMonitorSelection("Monitor", legacy_ordinal=2),
+        )
+
+    def test_change_speed_defaults_safely_and_rejects_invalid_saves(self) -> None:
+        self.assertEqual(settings.load_change_speed(), "slow")
+
+        for value in (None, True, 2, "", "turbo"):
+            with self.subTest(value=value):
+                self.write_json({"change_speed": value})
+                self.assertEqual(settings.load_change_speed(), "slow")
+
+        with self.assertRaises(ValueError):
+            settings.save_change_speed("turbo")
 
     def test_legacy_settings_load_but_boolean_ordinal_does_not(self) -> None:
         self.write_json({"selected_monitor": {"description": "Monitor", "ordinal": 2}})

@@ -20,7 +20,13 @@ from ddc import (
     set_monitor_volume,
 )
 from overlay import VolumeOverlay
-from settings import load_selected_monitor_key, save_selected_monitor_key
+from settings import (
+    DEFAULT_CHANGE_SPEED,
+    load_change_speed,
+    load_selected_monitor_key,
+    save_change_speed,
+    save_selected_monitor_key,
+)
 from theme import (
     apply_app_icon,
     apply_color_scheme,
@@ -46,8 +52,11 @@ class DisplayTopologyChanged(RuntimeError):
 
 
 class MonitorVolumeApp:
-    STEP_SIZE = 1
-    STEP_OPTIONS = (1, 2, 3)
+    CHANGE_SPEED_STEPS = {
+        "slow": 1,
+        "medium": 2,
+        "fast": 3,
+    }
     TRAY_TOOLTIP = "windows-ddc"
     DISPLAY_CHANGE_DEBOUNCE_MS = 500
     DDC_OPERATION_TIMEOUT_MS = 10_000
@@ -69,7 +78,8 @@ class MonitorVolumeApp:
         self.selected_key: SavedMonitorSelection | None = None
         self.current_volume: int | None = None
         self.target_volume: int | None = None
-        self.volume_step = self.STEP_SIZE
+        self.change_speed = load_change_speed()
+        self.volume_step = self.CHANGE_SPEED_STEPS[self.change_speed]
         self.app_icon_path: Path | None = None
         self._busy = False
         self._closing = False
@@ -103,7 +113,7 @@ class MonitorVolumeApp:
         self.monitor_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=0.0)
         self.volume_text_var = tk.StringVar(value="--")
-        self.volume_step_var = tk.StringVar(value=f"+{self.volume_step}")
+        self.change_speed_var = tk.StringVar(value=self.change_speed.title())
         self.status_var = tk.StringVar(value="Searching for monitors...")
 
         self.app_icon_path = apply_app_icon(self.root)
@@ -148,17 +158,28 @@ class MonitorVolumeApp:
 
         ttk.Label(content, text="Volume:").grid(row=2, column=0, sticky="w", pady=(14, 0))
 
-        ttk.Label(content, text="Step:").grid(row=2, column=1, sticky="e", pady=(14, 0))
-
-        self.volume_step_combo = ttk.Combobox(
-            content,
-            textvariable=self.volume_step_var,
-            values=tuple(f"+{step}" for step in self.STEP_OPTIONS),
-            state="readonly",
-            width=4,
+        ttk.Label(content, text="Change speed:").grid(
+            row=2,
+            column=1,
+            sticky="e",
+            pady=(14, 0),
         )
-        self.volume_step_combo.grid(row=2, column=2, sticky="w", padx=(4, 8), pady=(14, 0))
-        self.volume_step_combo.bind("<<ComboboxSelected>>", self.on_volume_step_selected)
+
+        self.change_speed_combo = ttk.Combobox(
+            content,
+            textvariable=self.change_speed_var,
+            values=tuple(speed.title() for speed in self.CHANGE_SPEED_STEPS),
+            state="readonly",
+            width=8,
+        )
+        self.change_speed_combo.grid(
+            row=2,
+            column=2,
+            sticky="w",
+            padx=(4, 8),
+            pady=(14, 0),
+        )
+        self.change_speed_combo.bind("<<ComboboxSelected>>", self.on_change_speed_selected)
 
         self.volume_value_label = ttk.Label(
             content,
@@ -262,18 +283,20 @@ class MonitorVolumeApp:
             self._listener = None
             self._set_status(self._format_error(exc))
 
-    def on_volume_step_selected(self, _event: Any = None) -> None:
-        try:
-            selected_step = int(self.volume_step_var.get().removeprefix("+"))
-        except ValueError:
-            selected_step = self.STEP_SIZE
+    def on_change_speed_selected(self, _event: Any = None) -> None:
+        selected_speed = self.change_speed_var.get().strip().lower()
+        if selected_speed not in self.CHANGE_SPEED_STEPS:
+            selected_speed = DEFAULT_CHANGE_SPEED
 
-        if selected_step not in self.STEP_OPTIONS:
-            selected_step = self.STEP_SIZE
-        self.volume_step = selected_step
-        self.volume_step_var.set(f"+{selected_step}")
+        self.change_speed = selected_speed
+        self.volume_step = self.CHANGE_SPEED_STEPS[selected_speed]
+        self.change_speed_var.set(selected_speed.title())
         if self._listener is not None:
-            self._listener.set_step(selected_step)
+            self._listener.set_step(self.volume_step)
+        try:
+            save_change_speed(selected_speed)
+        except (OSError, ValueError):
+            pass
 
     def _handle_display_change_from_thread(self) -> None:
         self._invalidate_topology_generation()

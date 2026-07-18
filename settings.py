@@ -8,6 +8,8 @@ from ddc import MonitorIdentity, SavedMonitorSelection
 
 
 SCHEMA_VERSION = 2
+DEFAULT_CHANGE_SPEED = "slow"
+CHANGE_SPEEDS = frozenset(("slow", "medium", "fast"))
 SETTINGS_PATH = Path(os.environ.get("APPDATA") or Path.home()) / "windows-ddc" / "settings.json"
 
 
@@ -18,7 +20,7 @@ def _optional_string(value: object) -> str | None:
     return value or None
 
 
-def load_selected_monitor_key() -> SavedMonitorSelection | None:
+def _read_settings_object() -> dict[str, object] | None:
     try:
         data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -27,6 +29,47 @@ def load_selected_monitor_key() -> SavedMonitorSelection | None:
         return None
 
     if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _normalized_change_speed(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    speed = value.strip().lower()
+    if speed not in CHANGE_SPEEDS:
+        return None
+    return speed
+
+
+def _write_settings_object(payload: dict[str, object]) -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = SETTINGS_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(SETTINGS_PATH)
+
+
+def load_change_speed() -> str:
+    data = _read_settings_object()
+    if data is None:
+        return DEFAULT_CHANGE_SPEED
+    return _normalized_change_speed(data.get("change_speed")) or DEFAULT_CHANGE_SPEED
+
+
+def save_change_speed(change_speed: str) -> None:
+    normalized_speed = _normalized_change_speed(change_speed)
+    if normalized_speed is None:
+        raise ValueError("Change speed must be slow, medium, or fast.")
+
+    existing = _read_settings_object()
+    payload = dict(existing) if existing is not None else {"schema_version": SCHEMA_VERSION}
+    payload["change_speed"] = normalized_speed
+    _write_settings_object(payload)
+
+
+def load_selected_monitor_key() -> SavedMonitorSelection | None:
+    data = _read_settings_object()
+    if data is None:
         return None
 
     selected_monitor = data.get("selected_monitor")
@@ -84,14 +127,18 @@ def save_selected_monitor_key(selection: SavedMonitorSelection) -> None:
     if selection.identity.serial_number is not None:
         identity_payload["serial_number"] = selection.identity.serial_number
 
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_settings_object()
+    change_speed = DEFAULT_CHANGE_SPEED
+    if existing is not None:
+        change_speed = (
+            _normalized_change_speed(existing.get("change_speed")) or DEFAULT_CHANGE_SPEED
+        )
     payload = {
         "schema_version": SCHEMA_VERSION,
+        "change_speed": change_speed,
         "selected_monitor": {
             "description": selection.description,
             "identity": identity_payload,
         },
     }
-    temp_path = SETTINGS_PATH.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temp_path.replace(SETTINGS_PATH)
+    _write_settings_object(payload)

@@ -11,7 +11,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Added release-history, architecture, and repository-agent documentation.
 - Added hardware-free unit coverage for hook liveness, readiness loss, write failures, shutdown, and paired volume-key events.
 - Added EDID/device-path monitor identity, display/device change notifications, error overlays, and hardware-free identity/settings/revalidation coverage.
-- Added a `+1`/`+2`/`+3` volume-step selector for the GUI buttons and global volume keys.
+- Added a persistent **Change speed** selector with Slow (`+1`), Medium (`+2`), and Fast (`+3`) choices for the GUI buttons and global volume keys.
 - Added hardware-free tray acknowledgement, fallback, timeout, and Explorer-restart recovery coverage.
 - Added hardware-free coverage for queued-callback containment, DDC watchdog behavior, bounded native-thread lifecycle waits, and shutdown diagnostics.
 

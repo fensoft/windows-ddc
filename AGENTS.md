@@ -9,7 +9,7 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, display invalidation, fresh-handle revalidation, and tray recovery. There is no lint, format, type-check, third-party test-framework, or CI configuration. State that limitation accurately.
+- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, display invalidation, fresh-handle revalidation, resilience, and tray recovery. There is no lint, format, type-check, third-party test-framework, or CI configuration. State that limitation accurately.
 
 ## Runtime Shape
 
@@ -32,7 +32,7 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `main.py` | Unsupported launcher stub; prints migration guidance and returns `1`. |
 | `gui.py` | UI state machine, selection, readiness, queues, worker serialization, tray/window lifecycle. |
 | `ddc.py` | Monitor identity, enumeration, clamping, and DDC read/write wrappers. |
-| `settings.py` | Per-user selected-monitor JSON load/save. |
+| `settings.py` | Per-user selected-monitor and Change speed JSON load/save. |
 | `overlay.py` | Topmost, auto-hiding volume `Toplevel`. |
 | `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
 | `windows_platform.py` | Win32 ctypes ABI, monitor identity/EDID inventory, display notifications, tray controller, global keyboard hook, and DWM helpers. |
@@ -49,10 +49,10 @@ Changes to the icon name or location must update `theme.APP_ICON_PATH`, `--windo
 ## Persistent or Sensitive Data
 
 - Live settings normally reside at `%APPDATA%\windows-ddc\settings.json`; if `APPDATA` is empty or unset, the fallback is `<home>\windows-ddc\settings.json`.
-- New settings use schema version 2 and persist description plus a Windows device path and optional EDID manufacturer/product/serial identity. Never persist the transient display index.
+- New settings use schema version 2 and persist `change_speed` plus description, a Windows device path, and optional EDID manufacturer/product/serial identity. Never persist the transient display index.
 - Unique EDID serial identity is preferred. Duplicate serials require the saved device path; monitors without a usable serial use the device path. Missing or ambiguous matches fail closed.
-- Saving writes `settings.tmp` and then replaces `settings.json`. There is backward-compatible loading/promotion for unambiguous legacy description/ordinal files, but no lock or multi-instance coordination.
-- Missing, unreadable, invalid-JSON, non-object, unknown-version, and invalid nested settings are treated as absent. JSON booleans are rejected as legacy ordinals.
+- Saving either monitor selection or Change speed writes `settings.tmp` and then replaces `settings.json` while preserving the other valid setting. There is backward-compatible loading/promotion for unambiguous legacy description/ordinal files, but no lock or multi-instance coordination.
+- Missing, unreadable, invalid-JSON, non-object, unknown-version, and invalid nested monitor settings are treated as absent. JSON booleans are rejected as legacy ordinals. Missing or invalid Change speed defaults to `slow`; valid persisted values are `slow`, `medium`, and `fast`.
 - Do not read, overwrite, delete, or reset a user's live `settings.json` or leftover `settings.tmp` during automated work. Patch `settings.SETTINGS_PATH` to a unique temporary path before calling load/save functions.
 - The physical monitor volume is external mutable state. A set can succeed even if the following readback fails, and shutdown does not restore the old value.
 - No secrets are currently used or stored. Never add tokens, credentials, private endpoints, dumps, or machine-specific values to source, screenshots, fixtures, logs, or documentation.
@@ -83,6 +83,7 @@ There is no deploy, publish, tag, installer, or signing command in this reposito
 - `ddc.set_monitor_volume(monitor_ref, target_volume) -> int`
 - `ddc.change_monitor_volume(monitor_ref, delta) -> int` (currently unused by the GUI)
 - `settings.load_selected_monitor_key()` and `settings.save_selected_monitor_key()`
+- `settings.load_change_speed()` and `settings.save_change_speed()`
 - `windows_platform.DisplayChangeListener`, `TrayIconController`, and `GlobalVolumeKeyListener`
 
 Keep each per-monitor DDC get/set sequence inside `with monitor_ref.monitor:`. Enumeration remains through `get_monitors()`, and description lookup remains on the wrapper. Preserve `0`–`100` application clamping and treat the post-write readback as authoritative when it succeeds.
@@ -121,6 +122,7 @@ GUI, tray, hook, theme, or DDC changes require an authorized Windows/manual pass
 - discovery, duplicate descriptions, fallback, and saved selection;
 - successful and failed volume reads;
 - slider/button/key writes and readback;
+- Slow/Medium/Fast Change speed behavior for buttons and keys, including restart persistence;
 - key pass-through before readiness and after exit;
 - rapid-write coalescing and `0`/`100` boundaries;
 - overlay visibility and auto-hide;
