@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from unittest.mock import Mock
 
+from ddc import MonitorIdentity, SavedMonitorSelection
 from gui import MonitorVolumeApp
 from windows_platform import (
     GlobalVolumeKeyListener,
@@ -27,7 +29,13 @@ class MonitorVolumeAppHotkeyTests(unittest.TestCase):
         app._hotkeys_ready = True
         app._hotkeys_enabled = False
         app._listener = listener
-        app.selected_key = ("Test monitor", 1)
+        app._display_listener = ListenerState(is_active=True)
+        app._topology_valid = threading.Event()
+        app._topology_valid.set()
+        app.selected_key = SavedMonitorSelection(
+            description="Test monitor",
+            identity=MonitorIdentity(device_path="test-path"),
+        )
         app.current_volume = 50
         return app
 
@@ -41,6 +49,8 @@ class MonitorVolumeAppHotkeyTests(unittest.TestCase):
         safety_conditions = (
             ("hook start failure", "_listener", None),
             ("hook runtime failure", "listener_active", False),
+            ("display listener failure", "display_listener_active", False),
+            ("topology invalid", "topology_valid", False),
             ("refresh in progress", "_hotkeys_ready", False),
             ("monitor unavailable", "current_volume", None),
             ("selection cleared", "selected_key", None),
@@ -50,12 +60,21 @@ class MonitorVolumeAppHotkeyTests(unittest.TestCase):
             with self.subTest(name=name):
                 listener.is_active = True
                 app._listener = listener
+                app._display_listener.is_active = True
+                app._topology_valid.set()
                 app._hotkeys_ready = True
                 app.current_volume = 50
-                app.selected_key = ("Test monitor", 1)
+                app.selected_key = SavedMonitorSelection(
+                    description="Test monitor",
+                    identity=MonitorIdentity(device_path="test-path"),
+                )
                 app._closing = False
                 if attribute == "listener_active":
                     listener.is_active = value
+                elif attribute == "display_listener_active":
+                    app._display_listener.is_active = value
+                elif attribute == "topology_valid":
+                    app._topology_valid.clear()
                 else:
                     setattr(app, attribute, value)
 
@@ -83,6 +102,11 @@ class MonitorVolumeAppHotkeyTests(unittest.TestCase):
         app._set_displayed_volume = Mock()
         app._set_status = Mock()
         app._apply_control_state = Mock()
+        app._show_unavailable_error = Mock()
+        app._schedule_refresh = Mock()
+        app._run_deferred_refresh = Mock()
+        app._refresh_requested = False
+        app._refresh_retry_index = 2
 
         app._finish_volume_write_error(RuntimeError("DDC connection lost"))
 
@@ -94,12 +118,11 @@ class MonitorVolumeAppHotkeyTests(unittest.TestCase):
         self.assertFalse(app._hotkeys_ready)
         self.assertFalse(app._hotkeys_enabled)
         app._set_displayed_volume.assert_called_once_with(None)
-        app._overlay.hide.assert_called_once_with()
-        app._set_status.assert_called_once_with(
-            "DDC connection lost. Monitor volume may have changed. "
-            "Refresh to resume volume-key control."
+        app._show_unavailable_error.assert_called_once_with(
+            "DDC connection lost. Monitor volume may have changed; control is disabled."
         )
         app._apply_control_state.assert_called_once_with()
+        app._schedule_refresh.assert_called_once_with(500, automatic=True)
 
 
 class GlobalVolumeKeyListenerTests(unittest.TestCase):
@@ -110,6 +133,26 @@ class GlobalVolumeKeyListenerTests(unittest.TestCase):
             on_error=lambda _error: None,
             step=2,
         )
+
+    def test_unavailable_notice_is_latched_without_consuming_the_key(self) -> None:
+        notices: list[str] = []
+        listener = GlobalVolumeKeyListener(
+            on_delta=lambda _delta: None,
+            should_consume=lambda: False,
+            on_error=lambda _error: None,
+            step=2,
+            on_unavailable=lambda: notices.append("unavailable"),
+            should_report_unavailable=lambda: True,
+        )
+
+        consume, delta = listener._resolve_volume_key_event(VK_VOLUME_UP, WM_KEYDOWN)
+        self.assertEqual((consume, delta), (False, None))
+        listener._report_unavailable_key_event(WM_KEYDOWN, consume)
+        listener._report_unavailable_key_event(WM_KEYDOWN, consume)
+        self.assertEqual(notices, ["unavailable"])
+
+        listener.reset_unavailable_notice()
+        self.assertFalse(listener._unavailable_notice_reported.is_set())
 
     def test_listener_active_state_is_explicit(self) -> None:
         listener = self.make_listener({"value": True})

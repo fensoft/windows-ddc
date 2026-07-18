@@ -10,12 +10,15 @@ That audited history contains one parentless commit. The audit clone had no loca
 
 - Added release-history, architecture, and repository-agent documentation.
 - Added hardware-free unit coverage for hook liveness, readiness loss, write failures, shutdown, and paired volume-key events.
+- Added EDID/device-path monitor identity, display/device change notifications, error overlays, and hardware-free identity/settings/revalidation coverage.
 
 ### Changed
 
 - Expanded user and operator documentation without changing runtime behavior.
 - Made global Volume Down/Up interception require a live native hook and release subsequent presses after an uncertain DDC write result until Refresh succeeds.
 - Kept the consume/pass-through decision stable from the first key-down through the matching key-up.
+- Replaced description/ordinal persistence with backward-compatible schema-version-2 stable identity matching; missing or ambiguous targets now fail closed instead of selecting another monitor.
+- Reacquire and exact-match fresh monitor wrappers before every actual DDC write, reject stale topology generations, and automatically rediscover after display changes or uncertain writes.
 
 ## [0.1.0] - 2026-03-22
 

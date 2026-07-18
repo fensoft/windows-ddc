@@ -9,10 +9,12 @@ from typing import Any, Callable, TypeAlias
 
 from ddc import (
     MonitorRef,
-    SelectionKey,
+    SavedMonitorSelection,
+    SelectionMatch,
+    SelectionMatchStatus,
     clamp,
     enumerate_monitors,
-    pick_selected_monitor_index,
+    match_selected_monitor,
     read_monitor_volume,
     set_monitor_volume,
 )
@@ -25,15 +27,28 @@ from theme import (
     apply_window_chrome,
     is_windows_dark_mode_enabled,
 )
-from windows_platform import GlobalVolumeKeyListener, TrayIconController
+from windows_platform import DisplayChangeListener, GlobalVolumeKeyListener, TrayIconController
 
 
-RefreshResult: TypeAlias = tuple[list[MonitorRef], int | None, int | None, Exception | None]
+RefreshResult: TypeAlias = tuple[list[MonitorRef], SelectionMatch, int | None, Exception | None]
+WriteResult: TypeAlias = tuple[list[MonitorRef], int, int, SavedMonitorSelection]
+
+
+class MonitorSelectionUnavailable(RuntimeError):
+    def __init__(self, message: str, monitors: list[MonitorRef] | None = None) -> None:
+        super().__init__(message)
+        self.monitors = monitors
+
+
+class DisplayTopologyChanged(RuntimeError):
+    pass
 
 
 class MonitorVolumeApp:
     STEP_SIZE = 1
     TRAY_TOOLTIP = "windows-ddc"
+    DISPLAY_CHANGE_DEBOUNCE_MS = 500
+    REFRESH_RETRY_DELAYS_MS = (1000, 2000, 4000)
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -48,7 +63,7 @@ class MonitorVolumeApp:
 
         self.monitors: list[MonitorRef] = []
         self.preferred_selected_key = load_selected_monitor_key()
-        self.selected_key: SelectionKey | None = None
+        self.selected_key: SavedMonitorSelection | None = None
         self.current_volume: int | None = None
         self.target_volume: int | None = None
         self.app_icon_path: Path | None = None
@@ -60,6 +75,7 @@ class MonitorVolumeApp:
         self._hotkeys_ready = False
         self._hotkeys_enabled = False
         self._listener: GlobalVolumeKeyListener | None = None
+        self._display_listener: DisplayChangeListener | None = None
         self._overlay: VolumeOverlay | None = None
         self._volume_write_inflight = False
         self._pending_target_volume: int | None = None
@@ -67,6 +83,13 @@ class MonitorVolumeApp:
         self._in_tray = False
         self._poll_after_id: str | None = None
         self._refresh_after_id: str | None = None
+        self._refresh_retry_index = 0
+        self._refresh_requested = False
+        self._refresh_requested_automatic = False
+        self._topology_generation = 0
+        self._topology_generation_lock = threading.Lock()
+        self._topology_valid = threading.Event()
+        self._control_unavailable_reason: str | None = "Monitor selection is not ready."
 
         self.monitor_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=0.0)
@@ -80,11 +103,15 @@ class MonitorVolumeApp:
         self._lock_window_size()
         apply_window_chrome(self.root, self.dark_mode)
         self._apply_control_state()
+        self._start_display_listener()
         self._start_tray_icon()
         self._start_minimized()
         self._start_keyboard_listener()
         self._poll_after_id = self.root.after(50, self._poll_queues)
-        self._refresh_after_id = self.root.after(50, self.refresh_monitors)
+        self._refresh_after_id = self.root.after(
+            50,
+            lambda: self._run_scheduled_refresh(automatic=False),
+        )
 
     def _build_widgets(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -101,7 +128,7 @@ class MonitorVolumeApp:
             content,
             textvariable=self.monitor_var,
             state="readonly",
-            width=34,
+            width=44,
         )
         self.monitor_combo.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.monitor_combo.bind("<<ComboboxSelected>>", self.on_monitor_selected)
@@ -160,10 +187,23 @@ class MonitorVolumeApp:
 
     def _lock_window_size(self) -> None:
         self.root.update_idletasks()
-        width = max(self.root.winfo_reqwidth(), 440)
+        width = max(self.root.winfo_reqwidth(), 520)
         height = self.root.winfo_reqheight()
         self.root.geometry(f"{width}x{height}")
         self.root.resizable(False, False)
+
+    def _start_display_listener(self) -> None:
+        self._display_listener = DisplayChangeListener(
+            on_change=self._handle_display_change_from_thread,
+            on_error=self._handle_display_listener_error_from_thread,
+        )
+        try:
+            self._display_listener.start()
+        except Exception as exc:
+            self._display_listener = None
+            self._topology_valid.clear()
+            self._control_unavailable_reason = "Display-change protection is unavailable."
+            self._set_status(f"Display-change listener failed: {self._format_error(exc)}")
 
     def _start_tray_icon(self) -> None:
         self._tray_icon = TrayIconController(
@@ -190,12 +230,50 @@ class MonitorVolumeApp:
             should_consume=self._should_consume_volume_keys,
             on_error=self._handle_listener_error_from_thread,
             step=self.STEP_SIZE,
+            on_unavailable=self._queue_unavailable_hotkey_notice,
+            should_report_unavailable=self._should_report_unavailable_hotkey,
         )
         try:
             self._listener.start()
         except Exception as exc:
             self._listener = None
             self._set_status(self._format_error(exc))
+
+    def _handle_display_change_from_thread(self) -> None:
+        self._invalidate_topology_generation()
+        self._post_to_ui(self._handle_display_change)
+
+    def _handle_display_listener_error_from_thread(self, exc: Exception) -> None:
+        self._invalidate_topology_generation()
+        self._post_to_ui(lambda error=exc: self._handle_display_listener_error(error))
+
+    def _handle_display_listener_error(self, exc: Exception) -> None:
+        self._hotkeys_ready = False
+        self.current_volume = None
+        self.target_volume = None
+        self._pending_target_volume = None
+        self._control_unavailable_reason = "Display-change protection is unavailable."
+        self._update_hotkey_state()
+        self._set_displayed_volume(None)
+        self._set_status(f"Display-change listener failed: {self._format_error(exc)}")
+        self._apply_control_state()
+
+    def _handle_display_change(self) -> None:
+        if self._closing:
+            return
+        self._hotkeys_ready = False
+        self.current_volume = None
+        self.target_volume = None
+        self._pending_target_volume = None
+        self._control_unavailable_reason = "Display configuration changed; checking the selected monitor."
+        self._update_hotkey_state()
+        self._set_displayed_volume(None)
+        if self._listener is not None:
+            self._listener.reset_unavailable_notice()
+        self._set_status("Display configuration changed. Revalidating the selected monitor...")
+        self._apply_control_state()
+        self._refresh_retry_index = 0
+        self._schedule_refresh(self.DISPLAY_CHANGE_DEBOUNCE_MS, automatic=True)
 
     def _handle_listener_error_from_thread(self, exc: Exception) -> None:
         self._post_to_ui(lambda error=exc: self._handle_listener_error(error))
@@ -211,13 +289,48 @@ class MonitorVolumeApp:
     def _handle_tray_error(self, exc: Exception) -> None:
         self._set_status(f"Tray icon failed: {self._format_error(exc)}")
 
+    def _invalidate_topology_generation(self) -> None:
+        self._topology_valid.clear()
+        with self._topology_generation_lock:
+            self._topology_generation += 1
+
+    def _current_topology_generation(self) -> int:
+        with self._topology_generation_lock:
+            return self._topology_generation
+
+    def _is_topology_generation_current(self, generation: int) -> bool:
+        return generation == self._current_topology_generation()
+
+    def _display_listener_available(self) -> bool:
+        return self._display_listener is not None and self._display_listener.is_active
+
+    def _control_ready(self) -> bool:
+        return (
+            not self._closing
+            and self._display_listener_available()
+            and self._topology_valid.is_set()
+            and self.selected_key is not None
+            and self.current_volume is not None
+        )
+
     def _queue_hotkey_delta(self, delta: int) -> None:
         if not self._closing:
             self._hotkey_delta_queue.put(delta)
 
+    def _queue_unavailable_hotkey_notice(self) -> None:
+        self._post_to_ui(self._show_unavailable_error)
+
+    def _should_report_unavailable_hotkey(self) -> bool:
+        return (
+            not self._closing
+            and self._control_unavailable_reason is not None
+            and (self.selected_key is not None or self.preferred_selected_key is not None)
+        )
+
     def _should_consume_volume_keys(self) -> bool:
         return (
             self._hotkeys_enabled
+            and self._topology_valid.is_set()
             and not self._closing
             and self._listener is not None
             and self._listener.is_active
@@ -275,11 +388,11 @@ class MonitorVolumeApp:
             return
 
         has_monitors = bool(self.monitors)
-        has_volume = has_monitors and self.current_volume is not None
-
         self._set_widget_enabled(self.refresh_button, not self._busy)
         self._set_widget_enabled(self.monitor_combo, has_monitors and not self._busy)
-        volume_controls_enabled = has_volume and (not self._busy or self._volume_write_inflight)
+        volume_controls_enabled = self._control_ready() and (
+            not self._busy or self._volume_write_inflight
+        )
         self._set_widget_enabled(self.decrease_button, volume_controls_enabled)
         self._set_widget_enabled(self.increase_button, volume_controls_enabled)
         self._set_widget_enabled(self.volume_scale, volume_controls_enabled)
@@ -293,20 +406,21 @@ class MonitorVolumeApp:
     def _update_hotkey_state(self) -> None:
         self._hotkeys_enabled = (
             self._hotkeys_ready
-            and not self._closing
+            and self._control_ready()
             and self._listener is not None
             and self._listener.is_active
-            and self.selected_key is not None
-            and self.current_volume is not None
         )
 
-    def _remember_selected_monitor(self, selection_key: SelectionKey) -> None:
-        self.selected_key = selection_key
-        self.preferred_selected_key = selection_key
+    def _remember_selected_monitor(self, selection: SavedMonitorSelection) -> None:
+        self.selected_key = selection
+        should_save = self.preferred_selected_key != selection
+        self.preferred_selected_key = selection
         self._update_hotkey_state()
+        if not should_save:
+            return
         try:
-            save_selected_monitor_key(selection_key)
-        except OSError:
+            save_selected_monitor_key(selection)
+        except (OSError, ValueError):
             pass
 
     def _set_displayed_volume(self, volume: int | None) -> None:
@@ -326,9 +440,14 @@ class MonitorVolumeApp:
             return
         if volume is None:
             volume = self.current_volume
-        if volume is None:
-            return
-        self._overlay.show(clamp(volume, 0, 100))
+        if volume is not None:
+            self._overlay.show(clamp(volume, 0, 100))
+
+    def _show_unavailable_error(self, message: str | None = None) -> None:
+        reason = message or self._control_unavailable_reason or "Selected monitor is unavailable."
+        self._set_status(reason)
+        if not self._closing and self._overlay is not None:
+            self._overlay.show_error(reason)
 
     def _selected_monitor(self) -> MonitorRef | None:
         current_index = self.monitor_combo.current()
@@ -336,14 +455,14 @@ class MonitorVolumeApp:
             return None
         return self.monitors[current_index]
 
-    def _clear_selected_monitor(self) -> None:
+    def _clear_active_selection(self) -> None:
         self.selected_key = None
         self.current_volume = None
         self.target_volume = None
         self._set_displayed_volume(None)
         self._hotkeys_ready = False
-        self._volume_write_inflight = False
         self._pending_target_volume = None
+        self._topology_valid.clear()
         self._update_hotkey_state()
 
     def _current_target_volume(self) -> int | None:
@@ -351,52 +470,240 @@ class MonitorVolumeApp:
             return self.target_volume
         return self.current_volume
 
-    def _run_background(
+    def _update_monitor_list(self, monitors: list[MonitorRef], selected_index: int | None) -> None:
+        self.monitors = monitors
+        self.monitor_combo["values"] = [monitor_ref.display_name for monitor_ref in monitors]
+        if selected_index is None:
+            self.monitor_var.set("")
+        else:
+            self.monitor_combo.current(selected_index)
+
+    @staticmethod
+    def _selection_error_message(status: SelectionMatchStatus) -> str:
+        if status == SelectionMatchStatus.AMBIGUOUS:
+            return "Selected monitor identity is ambiguous. Select the monitor again."
+        if status == SelectionMatchStatus.UNVERIFIABLE:
+            return "The monitor identity could not be verified; volume control is disabled."
+        if status == SelectionMatchStatus.NEEDS_SELECTION:
+            return "Select a monitor before monitor-volume control can start."
+        return "Selected monitor was not found. Reconnect it or select another monitor."
+
+    def _schedule_refresh(self, delay_ms: int, automatic: bool) -> None:
+        if self._closing:
+            return
+        if self._refresh_after_id is not None:
+            self.root.after_cancel(self._refresh_after_id)
+        self._refresh_after_id = self.root.after(
+            delay_ms,
+            lambda: self._run_scheduled_refresh(automatic=automatic),
+        )
+
+    def _run_scheduled_refresh(self, automatic: bool) -> None:
+        self._refresh_after_id = None
+        self.refresh_monitors(automatic=automatic)
+
+    def _schedule_next_refresh_retry(self) -> None:
+        if self._refresh_retry_index >= len(self.REFRESH_RETRY_DELAYS_MS):
+            return
+        delay = self.REFRESH_RETRY_DELAYS_MS[self._refresh_retry_index]
+        self._refresh_retry_index += 1
+        self._schedule_refresh(delay, automatic=True)
+
+    def _run_deferred_refresh(self) -> None:
+        if not self._refresh_requested or self._busy or self._closing:
+            return
+        automatic = self._refresh_requested_automatic
+        self._refresh_requested = False
+        self._refresh_requested_automatic = False
+        if self._refresh_after_id is not None:
+            self.root.after_cancel(self._refresh_after_id)
+            self._refresh_after_id = None
+        self.refresh_monitors(automatic=automatic)
+
+    def refresh_monitors(
         self,
-        busy_message: str,
-        worker: Callable[[], Any],
-        on_success: Callable[[Any], None],
-        on_error: Callable[[Exception], None] | None = None,
+        automatic: bool = False,
+        selection_target: SavedMonitorSelection | None = None,
     ) -> None:
+        if self._refresh_after_id is not None:
+            self.root.after_cancel(self._refresh_after_id)
+            self._refresh_after_id = None
         if self._busy or self._closing:
+            self._refresh_requested = True
+            self._refresh_requested_automatic = self._refresh_requested_automatic or automatic
             return
 
-        self._set_busy(True, busy_message)
+        if not automatic:
+            self._refresh_retry_index = 0
+        if selection_target is None:
+            selection_target = self.selected_key or self.preferred_selected_key
+
+        generation = self._current_topology_generation()
+        self._topology_valid.clear()
+        self._hotkeys_ready = False
+        self.current_volume = None
+        self.target_volume = None
+        self._set_displayed_volume(None)
+        if selection_target is not None:
+            self._control_unavailable_reason = "Selected monitor is being revalidated."
+            if self._listener is not None:
+                self._listener.reset_unavailable_notice()
+        self._update_hotkey_state()
+        self._set_busy(True, "Searching for monitors...")
 
         def runner() -> None:
             try:
-                result = worker()
+                monitors = enumerate_monitors()
+                match = match_selected_monitor(monitors, selection_target)
+                if match.status != SelectionMatchStatus.FOUND or match.index is None:
+                    result: RefreshResult = monitors, match, None, None
+                else:
+                    try:
+                        volume = read_monitor_volume(monitors[match.index])
+                    except Exception as exc:
+                        result = monitors, match, None, exc
+                    else:
+                        result = monitors, match, volume, None
             except Exception as exc:
-                self._post_to_ui(lambda error=exc: self._background_failed(error, on_error))
+                self._post_to_ui(
+                    lambda error=exc, token=generation, retry=automatic: self._finish_refresh_error(
+                        error,
+                        token,
+                        retry,
+                    )
+                )
             else:
-                self._post_to_ui(lambda value=result: self._background_succeeded(value, on_success))
+                self._post_to_ui(
+                    lambda value=result, token=generation, retry=automatic: self._finish_refresh(
+                        value,
+                        token,
+                        retry,
+                    )
+                )
 
         threading.Thread(target=runner, name="ddc-gui-worker", daemon=True).start()
 
-    def _background_succeeded(self, result: Any, on_success: Callable[[Any], None]) -> None:
+    def _finish_refresh(self, result: RefreshResult, generation: int, automatic: bool) -> None:
         if self._closing:
             return
-
         self._busy = False
-        on_success(result)
-        self._apply_control_state()
-
-    def _background_failed(
-        self,
-        exc: Exception,
-        on_error: Callable[[Exception], None] | None,
-    ) -> None:
-        if self._closing:
+        if not self._is_topology_generation_current(generation):
+            self._apply_control_state()
+            self._schedule_refresh(self.DISPLAY_CHANGE_DEBOUNCE_MS, automatic=True)
             return
 
-        self._busy = False
-        if on_error is None:
-            self._set_status(self._format_error(exc))
+        monitors, match, volume, volume_error = result
+        selected_index = match.index if match.status == SelectionMatchStatus.FOUND else None
+        self._update_monitor_list(monitors, selected_index)
+
+        if match.status != SelectionMatchStatus.FOUND or selected_index is None:
+            self._clear_active_selection()
+            if not monitors:
+                reason = "No DDC/CI monitors found."
+            else:
+                reason = self._selection_error_message(match.status)
+            self._control_unavailable_reason = reason
+            self._set_status(reason)
+            self._apply_control_state()
+            if automatic and match.status not in (
+                SelectionMatchStatus.AMBIGUOUS,
+                SelectionMatchStatus.NEEDS_SELECTION,
+            ):
+                self._schedule_next_refresh_retry()
+            self._run_deferred_refresh()
+            return
+
+        selected_monitor = monitors[selected_index]
+        selection = selected_monitor.selection_key
+        if selection is None:
+            self._clear_active_selection()
+            self._control_unavailable_reason = self._selection_error_message(
+                SelectionMatchStatus.UNVERIFIABLE
+            )
+            self._set_status(self._control_unavailable_reason)
+            self._apply_control_state()
+            return
+
+        if volume_error is not None or volume is None:
+            self.selected_key = selection
+            self.current_volume = None
+            self.target_volume = None
+            self._hotkeys_ready = False
+            self._topology_valid.clear()
+            self._update_hotkey_state()
+            self._set_displayed_volume(None)
+            reason = self._format_error(volume_error or RuntimeError("Monitor volume is unavailable."))
+            self._control_unavailable_reason = reason
+            self._set_status(reason)
+            self._apply_control_state()
+            if automatic:
+                self._schedule_next_refresh_retry()
+            return
+
+        self.current_volume = volume
+        self.target_volume = volume
+        self._set_displayed_volume(volume)
+        self._remember_selected_monitor(selection)
+        if self._display_listener_available():
+            self._topology_valid.set()
+            self._hotkeys_ready = True
+            self._control_unavailable_reason = None
         else:
-            on_error(exc)
+            self._topology_valid.clear()
+            self._hotkeys_ready = False
+            self._control_unavailable_reason = "Display-change protection is unavailable."
+        self._update_hotkey_state()
+        if self._listener is not None:
+            self._listener.reset_unavailable_notice()
+        if self._control_ready():
+            self._set_status(
+                f"Ready. {len(monitors)} monitor(s) detected. Volume keys control {selected_monitor.description}."
+            )
+        else:
+            self._set_status(
+                f"{selected_monitor.description} detected at {volume}%, but display-change protection is unavailable."
+            )
         self._apply_control_state()
+        self._run_deferred_refresh()
 
-    def _request_volume_target(self, monitor_ref: MonitorRef, target_volume: int) -> None:
+    def _finish_refresh_error(self, exc: Exception, generation: int, automatic: bool) -> None:
+        if self._closing:
+            return
+        self._busy = False
+        if not self._is_topology_generation_current(generation):
+            self._schedule_refresh(self.DISPLAY_CHANGE_DEBOUNCE_MS, automatic=True)
+            return
+        self.monitors = []
+        self.monitor_combo["values"] = ()
+        self.monitor_var.set("")
+        self._clear_active_selection()
+        reason = self._format_error(exc)
+        self._control_unavailable_reason = reason
+        self._set_status(reason)
+        self._apply_control_state()
+        if automatic:
+            self._schedule_next_refresh_retry()
+        self._run_deferred_refresh()
+
+    def on_monitor_selected(self, _event: Any = None) -> None:
+        monitor_ref = self._selected_monitor()
+        if monitor_ref is None or self._busy:
+            return
+        selection = monitor_ref.selection_key
+        if selection is None:
+            self._clear_active_selection()
+            reason = "The selected monitor has no verifiable Windows identity."
+            self._control_unavailable_reason = reason
+            self._show_unavailable_error(reason)
+            self._apply_control_state()
+            return
+        self.refresh_monitors(selection_target=selection)
+
+    def _request_volume_target(self, target_volume: int) -> None:
+        if not self._control_ready() or self.selected_key is None:
+            self._show_unavailable_error()
+            return
+
         target_volume = clamp(target_volume, 0, 100)
         self.target_volume = target_volume
         self._set_displayed_volume(target_volume)
@@ -407,180 +714,133 @@ class MonitorVolumeApp:
             self._set_status(f"Queued volume {target_volume}%...")
             return
 
-        self._start_volume_write(monitor_ref, target_volume)
+        self._start_volume_write(self.selected_key, target_volume)
 
-    def _start_volume_write(self, monitor_ref: MonitorRef, target_volume: int) -> None:
-        if self._closing:
+    def _start_volume_write(
+        self,
+        selection: SavedMonitorSelection,
+        target_volume: int,
+    ) -> None:
+        if self._closing or not self._control_ready():
+            self._show_unavailable_error()
             return
 
+        generation = self._current_topology_generation()
         self._volume_write_inflight = True
         self._pending_target_volume = None
-        self._set_busy(True, f"Setting volume to {target_volume}%...")
+        self._set_busy(True, f"Validating monitor and setting volume to {target_volume}%...")
 
         def runner() -> None:
             try:
+                monitors = enumerate_monitors()
+                match = match_selected_monitor(monitors, selection)
+                if match.status != SelectionMatchStatus.FOUND or match.index is None:
+                    raise MonitorSelectionUnavailable(
+                        self._selection_error_message(match.status),
+                        monitors,
+                    )
+                if not self._is_topology_generation_current(generation) or not self._topology_valid.is_set():
+                    raise DisplayTopologyChanged(
+                        "Display changed while validating the selected monitor."
+                    )
+                monitor_ref = monitors[match.index]
+                fresh_selection = monitor_ref.selection_key
+                if fresh_selection is None:
+                    raise MonitorSelectionUnavailable(
+                        "The selected monitor identity could not be verified.",
+                        monitors,
+                    )
                 new_volume = set_monitor_volume(monitor_ref, target_volume)
+                result: WriteResult = monitors, match.index, new_volume, fresh_selection
             except Exception as exc:
-                self._post_to_ui(lambda error=exc: self._finish_volume_write_error(error))
+                self._post_to_ui(
+                    lambda error=exc, token=generation: self._finish_volume_write_error(
+                        error,
+                        token,
+                    )
+                )
             else:
                 self._post_to_ui(
-                    lambda value=new_volume, key=monitor_ref.selection_key: self._finish_volume_write_success(key, value)
+                    lambda value=result, token=generation: self._finish_volume_write_success(
+                        value,
+                        token,
+                    )
                 )
 
         threading.Thread(target=runner, name="ddc-volume-write", daemon=True).start()
 
-    def _finish_volume_write_success(self, selection_key: SelectionKey, new_volume: int) -> None:
+    def _finish_volume_write_success(self, result: WriteResult, generation: int) -> None:
         if self._closing:
             return
+        monitors, selected_index, new_volume, selection = result
+        if not self._is_topology_generation_current(generation) or not self._topology_valid.is_set():
+            self._finish_volume_write_error(
+                DisplayTopologyChanged(
+                    "Display changed while setting volume; monitor volume may have changed."
+                ),
+                generation,
+            )
+            return
 
+        self._update_monitor_list(monitors, selected_index)
         self.current_volume = new_volume
+        self.target_volume = new_volume
+        self._remember_selected_monitor(selection)
         self._hotkeys_ready = True
+        self._control_unavailable_reason = None
         self._update_hotkey_state()
 
         next_target = self._pending_target_volume
-        selected_monitor = self._selected_monitor()
-        if (
-            next_target is not None
-            and selected_monitor is not None
-            and selected_monitor.selection_key == selection_key
-            and next_target != new_volume
-        ):
+        if next_target is not None and next_target != new_volume:
             self._pending_target_volume = None
-            self._start_volume_write(selected_monitor, next_target)
+            self._volume_write_inflight = False
+            self._busy = False
+            self._start_volume_write(selection, next_target)
             return
 
         self._volume_write_inflight = False
+        self._pending_target_volume = None
         self._busy = False
-        self.target_volume = new_volume
         self._set_displayed_volume(new_volume)
         self._show_volume_overlay(new_volume)
-
-        monitor_name = selected_monitor.description if selected_monitor is not None else "Monitor"
-        self._set_status(f"{monitor_name} volume: {new_volume}%")
+        self._set_status(f"{selection.description} volume: {new_volume}%")
         self._apply_control_state()
+        self._run_deferred_refresh()
 
-    def _finish_volume_write_error(self, exc: Exception) -> None:
+    def _finish_volume_write_error(
+        self,
+        exc: Exception,
+        generation: int | None = None,
+    ) -> None:
         if self._closing:
             return
 
+        if isinstance(exc, MonitorSelectionUnavailable) and exc.monitors is not None:
+            self._update_monitor_list(exc.monitors, None)
         self._volume_write_inflight = False
         self._pending_target_volume = None
         self._busy = False
         self.current_volume = None
         self.target_volume = None
         self._hotkeys_ready = False
+        self._topology_valid.clear()
         self._update_hotkey_state()
         self._set_displayed_volume(None)
-        if self._overlay is not None:
-            self._overlay.hide()
         error_message = self._format_error(exc).rstrip(".")
-        self._set_status(
-            f"{error_message}. Monitor volume may have changed. Refresh to resume volume-key control."
-        )
+        if isinstance(exc, MonitorSelectionUnavailable):
+            reason = f"{error_message}."
+        elif isinstance(exc, DisplayTopologyChanged):
+            reason = f"{error_message}."
+        else:
+            reason = f"{error_message}. Monitor volume may have changed; control is disabled."
+        self._control_unavailable_reason = reason
+        self._show_unavailable_error(reason)
         self._apply_control_state()
-
-    def refresh_monitors(self) -> None:
-        self._refresh_after_id = None
-        selection_target = self.selected_key if self.selected_key is not None else self.preferred_selected_key
-        self._hotkeys_ready = False
-        self._update_hotkey_state()
-
-        def worker() -> RefreshResult:
-            monitors = enumerate_monitors()
-            selected_index = pick_selected_monitor_index(monitors, selection_target)
-            if selected_index is None:
-                return monitors, None, None, None
-
-            try:
-                volume = read_monitor_volume(monitors[selected_index])
-            except Exception as exc:
-                return monitors, selected_index, None, exc
-            return monitors, selected_index, volume, None
-
-        def on_success(result: RefreshResult) -> None:
-            monitors, selected_index, volume, volume_error = result
-            self.monitors = monitors
-            self.monitor_combo["values"] = [monitor_ref.display_name for monitor_ref in monitors]
-
-            if not monitors or selected_index is None:
-                self.monitor_var.set("")
-                self._clear_selected_monitor()
-                self._set_status("No DDC/CI monitors found.")
-                return
-
-            selected_monitor = monitors[selected_index]
-            self.monitor_combo.current(selected_index)
-            self._remember_selected_monitor(selected_monitor.selection_key)
-
-            if volume_error is None:
-                self.current_volume = volume
-                self.target_volume = volume
-                self._set_displayed_volume(volume)
-                self._hotkeys_ready = True
-                self._update_hotkey_state()
-                if self._hotkeys_enabled:
-                    self._set_status(
-                        f"Ready. {len(monitors)} monitor(s) detected. Volume keys control {selected_monitor.description}."
-                    )
-                else:
-                    self._set_status(
-                        f"Ready. {len(monitors)} monitor(s) detected. Global volume-key control is unavailable."
-                    )
-            else:
-                self.current_volume = None
-                self._set_displayed_volume(None)
-                self._hotkeys_ready = False
-                self._update_hotkey_state()
-                self._set_status(self._format_error(volume_error))
-
-        def on_error(exc: Exception) -> None:
-            self.monitors = []
-            self.monitor_combo["values"] = ()
-            self.monitor_var.set("")
-            self._clear_selected_monitor()
-            self._set_status(self._format_error(exc))
-
-        self._run_background("Searching for monitors...", worker, on_success, on_error)
-
-    def on_monitor_selected(self, _event: Any = None) -> None:
-        monitor_ref = self._selected_monitor()
-        if monitor_ref is None or self._busy:
-            return
-
-        self._remember_selected_monitor(monitor_ref.selection_key)
-        self.current_volume = None
-        self.target_volume = None
-        self._set_displayed_volume(None)
-        self._hotkeys_ready = False
-        self._update_hotkey_state()
-
-        def worker() -> int:
-            return read_monitor_volume(monitor_ref)
-
-        def on_success(volume: int) -> None:
-            self.current_volume = volume
-            self.target_volume = volume
-            self._set_displayed_volume(volume)
-            self._hotkeys_ready = True
-            self._update_hotkey_state()
-            if self._hotkeys_enabled:
-                self._set_status(
-                    f"{monitor_ref.description} selected. Volume keys now control this monitor at {volume}%."
-                )
-            else:
-                self._set_status(
-                    f"{monitor_ref.description} selected at {volume}%. Global volume-key control is unavailable."
-                )
-
-        def on_error(exc: Exception) -> None:
-            self.current_volume = None
-            self.target_volume = None
-            self._set_displayed_volume(None)
-            self._hotkeys_ready = False
-            self._update_hotkey_state()
-            self._set_status(self._format_error(exc))
-
-        self._run_background(f"Reading {monitor_ref.description} volume...", worker, on_success, on_error)
+        self._refresh_retry_index = 0
+        if self._refresh_requested:
+            self._run_deferred_refresh()
+        else:
+            self._schedule_refresh(self.DISPLAY_CHANGE_DEBOUNCE_MS, automatic=True)
 
     def on_scale_moved(self, value: str) -> None:
         if self._ignore_scale_events:
@@ -588,8 +848,8 @@ class MonitorVolumeApp:
         self.volume_text_var.set(f"{clamp(round(float(value)), 0, 100)}%")
 
     def on_scale_released(self, _event: Any = None) -> None:
-        monitor_ref = self._selected_monitor()
-        if monitor_ref is None or self.current_volume is None or (self._busy and not self._volume_write_inflight):
+        if not self._control_ready() or (self._busy and not self._volume_write_inflight):
+            self._show_unavailable_error()
             return
 
         target_volume = clamp(round(self.volume_var.get()), 0, 100)
@@ -598,15 +858,16 @@ class MonitorVolumeApp:
             self._show_volume_overlay(target_volume)
             return
 
-        self._request_volume_target(monitor_ref, target_volume)
+        self._request_volume_target(target_volume)
 
     def adjust_selected_volume(self, delta: int) -> None:
-        monitor_ref = self._selected_monitor()
-        if monitor_ref is None or self.current_volume is None or (self._busy and not self._volume_write_inflight):
+        if not self._control_ready() or (self._busy and not self._volume_write_inflight):
+            self._show_unavailable_error()
             return
 
         base_volume = self._current_target_volume()
         if base_volume is None:
+            self._show_unavailable_error()
             return
 
         target_volume = clamp(base_volume + delta, 0, 100)
@@ -618,7 +879,7 @@ class MonitorVolumeApp:
             self._show_volume_overlay(base_volume)
             return
 
-        self._request_volume_target(monitor_ref, target_volume)
+        self._request_volume_target(target_volume)
 
     def minimize_to_tray(self) -> None:
         if self._closing or self._in_tray or self._tray_icon is None:
@@ -656,6 +917,7 @@ class MonitorVolumeApp:
 
     def on_close(self) -> None:
         self._closing = True
+        self._topology_valid.clear()
         self._hotkeys_ready = False
         self._update_hotkey_state()
         if self._tray_icon is not None:
@@ -669,6 +931,9 @@ class MonitorVolumeApp:
         if self._listener is not None:
             self._listener.stop()
             self._listener = None
+        if self._display_listener is not None:
+            self._display_listener.stop()
+            self._display_listener = None
         if self._tray_icon is not None:
             self._tray_icon.stop()
             self._tray_icon = None

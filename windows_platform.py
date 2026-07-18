@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import threading
 from ctypes import wintypes
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +17,8 @@ WM_NULL = 0x0000
 WM_DESTROY = 0x0002
 WM_COMMAND = 0x0111
 WM_CONTEXTMENU = 0x007B
+WM_DISPLAYCHANGE = 0x007E
+WM_DEVICECHANGE = 0x0219
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_LBUTTONDBLCLK = 0x0203
@@ -27,6 +31,7 @@ WM_TRAYICON = WM_APP + 1
 WM_TRAY_SHOW = WM_APP + 2
 WM_TRAY_HIDE = WM_APP + 3
 WM_TRAY_EXIT = WM_APP + 4
+WM_DISPLAY_LISTENER_EXIT = WM_APP + 5
 VK_VOLUME_DOWN = 0xAE
 VK_VOLUME_UP = 0xAF
 IDI_APPLICATION = 32512
@@ -48,6 +53,17 @@ SM_CYSMICON = 50
 GA_ROOT = 2
 DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DBT_DEVNODES_CHANGED = 0x0007
+DBT_DEVICEARRIVAL = 0x8000
+DBT_DEVICEREMOVECOMPLETE = 0x8004
+DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
+DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001
+DISPLAY_DEVICE_ACTIVE = 0x00000001
+DICS_FLAG_GLOBAL = 0x00000001
+DIREG_DEV = 0x00000001
+KEY_READ = 0x00020019
+REG_BINARY = 3
 
 BYTE = ctypes.c_ubyte
 UINT_PTR = ctypes.c_size_t
@@ -63,6 +79,13 @@ LRESULT = ctypes.c_ssize_t
 HRESULT = ctypes.c_long
 HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL,
+    wintypes.HANDLE,
+    wintypes.HDC,
+    ctypes.POINTER(wintypes.RECT),
+    wintypes.LPARAM,
+)
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -119,6 +142,64 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
+class DISPLAY_DEVICEW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("DeviceName", wintypes.WCHAR * 32),
+        ("DeviceString", wintypes.WCHAR * 128),
+        ("StateFlags", wintypes.DWORD),
+        ("DeviceID", wintypes.WCHAR * 128),
+        ("DeviceKey", wintypes.WCHAR * 128),
+    ]
+
+
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+class DEV_BROADCAST_DEVICEINTERFACE_W(ctypes.Structure):
+    _fields_ = [
+        ("dbcc_size", wintypes.DWORD),
+        ("dbcc_devicetype", wintypes.DWORD),
+        ("dbcc_reserved", wintypes.DWORD),
+        ("dbcc_classguid", GUID),
+        ("dbcc_name", wintypes.WCHAR * 1),
+    ]
+
+
+class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("InterfaceClassGuid", GUID),
+        ("Flags", wintypes.DWORD),
+        ("Reserved", UINT_PTR),
+    ]
+
+
+class SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("ClassGuid", GUID),
+        ("DevInst", wintypes.DWORD),
+        ("Reserved", UINT_PTR),
+    ]
+
+
+@dataclass(frozen=True)
+class WindowsMonitorIdentity:
+    display_device_name: str
+    device_path: str
+    manufacturer_id: str | None = None
+    product_code: int | None = None
+    serial_number: str | None = None
+
+
 class PlatformError(RuntimeError):
     pass
 
@@ -126,6 +207,9 @@ class PlatformError(RuntimeError):
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
+setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 try:
     dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 except OSError:
@@ -219,12 +303,77 @@ user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.EnumDisplayMonitors.argtypes = [
+    wintypes.HDC,
+    ctypes.POINTER(wintypes.RECT),
+    MONITORENUMPROC,
+    wintypes.LPARAM,
+]
+user32.EnumDisplayMonitors.restype = wintypes.BOOL
+user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFOEXW)]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
+user32.EnumDisplayDevicesW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.POINTER(DISPLAY_DEVICEW),
+    wintypes.DWORD,
+]
+user32.EnumDisplayDevicesW.restype = wintypes.BOOL
+user32.RegisterDeviceNotificationW.argtypes = [wintypes.HANDLE, LPVOID, wintypes.DWORD]
+user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
+user32.UnregisterDeviceNotification.argtypes = [wintypes.HANDLE]
+user32.UnregisterDeviceNotification.restype = wintypes.BOOL
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.DWORD),
+]
+dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
+setupapi.SetupDiCreateDeviceInfoList.argtypes = [ctypes.POINTER(GUID), wintypes.HWND]
+setupapi.SetupDiCreateDeviceInfoList.restype = wintypes.HANDLE
+setupapi.SetupDiOpenDeviceInterfaceW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+]
+setupapi.SetupDiOpenDeviceInterfaceW.restype = wintypes.BOOL
+setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+    LPVOID,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(SP_DEVINFO_DATA),
+]
+setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+setupapi.SetupDiOpenDevRegKey.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(SP_DEVINFO_DATA),
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+]
+setupapi.SetupDiOpenDevRegKey.restype = wintypes.HANDLE
+setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+advapi32.RegQueryValueExW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPCWSTR,
+    LPVOID,
+    ctypes.POINTER(wintypes.DWORD),
+    LPVOID,
+    ctypes.POINTER(wintypes.DWORD),
+]
+advapi32.RegQueryValueExW.restype = wintypes.LONG
+advapi32.RegCloseKey.argtypes = [wintypes.HANDLE]
+advapi32.RegCloseKey.restype = wintypes.LONG
 if dwmapi is not None:
     dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, LPVOID, wintypes.DWORD]
     dwmapi.DwmSetWindowAttribute.restype = HRESULT
@@ -239,6 +388,225 @@ def win_error(message: str) -> OSError:
 
 def make_int_resource(value: int) -> wintypes.LPCWSTR:
     return ctypes.cast(ctypes.c_void_p(value), wintypes.LPCWSTR)
+
+
+def _normalize_edid_serial(value: str) -> str | None:
+    value = value.replace("\x00", "").strip().upper()
+    compact = re.sub(r"[^A-Z0-9]", "", value)
+    if not compact:
+        return None
+    if compact in {"0", "UNKNOWN", "NONE", "NA", "DEFAULT", "SERIAL", "SERIALNUMBER"}:
+        return None
+    if set(compact) <= {"0"} or set(compact) <= {"F"}:
+        return None
+    return value
+
+
+def parse_edid_identity(edid: bytes) -> tuple[str | None, int | None, str | None]:
+    if len(edid) < 128 or edid[:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return None, None, None
+
+    manufacturer_raw = int.from_bytes(edid[8:10], "big")
+    manufacturer_letters = (
+        (manufacturer_raw >> 10) & 0x1F,
+        (manufacturer_raw >> 5) & 0x1F,
+        manufacturer_raw & 0x1F,
+    )
+    if all(1 <= letter <= 26 for letter in manufacturer_letters):
+        manufacturer_id = "".join(chr(ord("A") + letter - 1) for letter in manufacturer_letters)
+    else:
+        manufacturer_id = None
+
+    raw_product_code = int.from_bytes(edid[10:12], "little")
+    product_code = raw_product_code or None
+
+    descriptor_serial = None
+    for offset in (54, 72, 90, 108):
+        descriptor = edid[offset : offset + 18]
+        if len(descriptor) == 18 and descriptor[:3] == b"\x00\x00\x00" and descriptor[3] == 0xFF:
+            descriptor_serial = _normalize_edid_serial(
+                descriptor[5:18].decode("ascii", errors="ignore")
+            )
+            if descriptor_serial is not None:
+                break
+
+    numeric_serial = int.from_bytes(edid[12:16], "little")
+    serial_number = descriptor_serial
+    if serial_number is None and numeric_serial not in (0, 0xFFFFFFFF):
+        serial_number = str(numeric_serial)
+
+    return manufacturer_id, product_code, serial_number
+
+
+def _read_monitor_edid(device_path: str) -> bytes | None:
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    device_info_set = setupapi.SetupDiCreateDeviceInfoList(None, None)
+    if not device_info_set or int(device_info_set) == invalid_handle_value:
+        return None
+
+    registry_key = None
+    try:
+        interface_data = SP_DEVICE_INTERFACE_DATA()
+        interface_data.cbSize = ctypes.sizeof(interface_data)
+        if not setupapi.SetupDiOpenDeviceInterfaceW(
+            device_info_set,
+            device_path,
+            0,
+            ctypes.byref(interface_data),
+        ):
+            return None
+
+        required_size = wintypes.DWORD()
+        setupapi.SetupDiGetDeviceInterfaceDetailW(
+            device_info_set,
+            ctypes.byref(interface_data),
+            None,
+            0,
+            ctypes.byref(required_size),
+            None,
+        )
+        if required_size.value == 0:
+            return None
+
+        detail_buffer = ctypes.create_string_buffer(required_size.value)
+        detail_cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+        ctypes.cast(detail_buffer, ctypes.POINTER(wintypes.DWORD)).contents.value = detail_cb_size
+        device_info_data = SP_DEVINFO_DATA()
+        device_info_data.cbSize = ctypes.sizeof(device_info_data)
+        if not setupapi.SetupDiGetDeviceInterfaceDetailW(
+            device_info_set,
+            ctypes.byref(interface_data),
+            detail_buffer,
+            required_size,
+            None,
+            ctypes.byref(device_info_data),
+        ):
+            return None
+
+        registry_key = setupapi.SetupDiOpenDevRegKey(
+            device_info_set,
+            ctypes.byref(device_info_data),
+            DICS_FLAG_GLOBAL,
+            0,
+            DIREG_DEV,
+            KEY_READ,
+        )
+        if not registry_key or int(registry_key) == invalid_handle_value:
+            registry_key = None
+            return None
+
+        value_type = wintypes.DWORD()
+        value_size = wintypes.DWORD()
+        if advapi32.RegQueryValueExW(
+            registry_key,
+            "EDID",
+            None,
+            ctypes.byref(value_type),
+            None,
+            ctypes.byref(value_size),
+        ) != 0:
+            return None
+        if value_type.value != REG_BINARY or value_size.value == 0:
+            return None
+
+        value_buffer = (ctypes.c_ubyte * value_size.value)()
+        if advapi32.RegQueryValueExW(
+            registry_key,
+            "EDID",
+            None,
+            ctypes.byref(value_type),
+            value_buffer,
+            ctypes.byref(value_size),
+        ) != 0:
+            return None
+        return bytes(value_buffer[: value_size.value])
+    finally:
+        if registry_key is not None:
+            advapi32.RegCloseKey(registry_key)
+        setupapi.SetupDiDestroyDeviceInfoList(device_info_set)
+
+
+def _display_device_identity(
+    display_device_name: str,
+    display_device: DISPLAY_DEVICEW,
+) -> WindowsMonitorIdentity | None:
+    device_path = display_device.DeviceID.strip()
+    if not device_path:
+        return None
+    edid = _read_monitor_edid(device_path)
+    manufacturer_id, product_code, serial_number = parse_edid_identity(edid or b"")
+    return WindowsMonitorIdentity(
+        display_device_name=display_device_name,
+        device_path=device_path,
+        manufacturer_id=manufacturer_id,
+        product_code=product_code,
+        serial_number=serial_number,
+    )
+
+
+def _identity_slots_for_hmonitor(
+    hmonitor: wintypes.HANDLE,
+) -> list[WindowsMonitorIdentity | None]:
+    physical_count = wintypes.DWORD()
+    if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(
+        hmonitor,
+        ctypes.byref(physical_count),
+    ):
+        raise win_error("GetNumberOfPhysicalMonitorsFromHMONITOR failed")
+
+    count = physical_count.value
+    monitor_info = MONITORINFOEXW()
+    monitor_info.cbSize = ctypes.sizeof(monitor_info)
+    if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(monitor_info)):
+        return [None] * count
+
+    active_devices: list[DISPLAY_DEVICEW] = []
+    device_index = 0
+    while True:
+        display_device = DISPLAY_DEVICEW()
+        display_device.cb = ctypes.sizeof(display_device)
+        if not user32.EnumDisplayDevicesW(
+            monitor_info.szDevice,
+            device_index,
+            ctypes.byref(display_device),
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        ):
+            break
+        if display_device.StateFlags & DISPLAY_DEVICE_ACTIVE and display_device.DeviceID.strip():
+            active_devices.append(display_device)
+        device_index += 1
+
+    if count == 1 and len(active_devices) == 1:
+        return [_display_device_identity(monitor_info.szDevice, active_devices[0])]
+    return [None] * count
+
+
+def enumerate_windows_monitor_identities() -> list[WindowsMonitorIdentity | None]:
+    identity_slots: list[WindowsMonitorIdentity | None] = []
+    callback_error: Exception | None = None
+
+    def callback(
+        hmonitor: wintypes.HANDLE,
+        _hdc: wintypes.HDC,
+        _rect: ctypes.POINTER(wintypes.RECT),
+        _data: wintypes.LPARAM,
+    ) -> bool:
+        nonlocal callback_error
+        try:
+            identity_slots.extend(_identity_slots_for_hmonitor(hmonitor))
+        except Exception as exc:
+            callback_error = exc
+            return False
+        return True
+
+    monitor_callback = MONITORENUMPROC(callback)
+    if not user32.EnumDisplayMonitors(None, None, monitor_callback, 0):
+        if callback_error is not None:
+            raise callback_error
+        raise win_error("EnumDisplayMonitors failed")
+    if callback_error is not None:
+        raise callback_error
+    return identity_slots
 
 
 def set_window_dark_mode(hwnd: int, enabled: bool) -> bool:
@@ -266,6 +634,154 @@ def get_toplevel_window_handle(hwnd: int) -> int:
     if top_level_hwnd:
         return int(top_level_hwnd)
     return int(hwnd)
+
+
+class DisplayChangeListener:
+    def __init__(
+        self,
+        on_change: Callable[[], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        self.on_change = on_change
+        self.on_error = on_error
+        self._instance = kernel32.GetModuleHandleW(None)
+        self._class_name = f"MonitorVolumeDisplayListener_{os.getpid()}_{id(self)}"
+        self._wndproc = WNDPROC(self._window_proc)
+        self._ready = threading.Event()
+        self._active = threading.Event()
+        self._thread = threading.Thread(
+            target=self._message_loop,
+            name="display-change-listener",
+            daemon=True,
+        )
+        self._start_error: Exception | None = None
+        self._hwnd: wintypes.HWND | None = None
+        self._notification_handle: wintypes.HANDLE | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self._active.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+        self._ready.wait()
+        if self._start_error is not None:
+            raise PlatformError(
+                f"Failed to initialize display-change listener: {self._start_error}"
+            ) from self._start_error
+        if self._hwnd is None or not self._active.is_set():
+            raise PlatformError("Failed to initialize display-change listener.")
+
+    def stop(self) -> None:
+        self._active.clear()
+        if self._hwnd is not None:
+            user32.PostMessageW(self._hwnd, WM_DISPLAY_LISTENER_EXIT, 0, 0)
+        if self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def _message_loop(self) -> None:
+        class_registered = False
+        window_class = WNDCLASSW()
+        window_class.lpfnWndProc = self._wndproc
+        window_class.hInstance = self._instance
+        window_class.lpszClassName = self._class_name
+
+        if not user32.RegisterClassW(ctypes.byref(window_class)):
+            self._start_error = win_error("RegisterClassW failed")
+            self._ready.set()
+            return
+        class_registered = True
+
+        hwnd = user32.CreateWindowExW(
+            0,
+            self._class_name,
+            self._class_name,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            self._instance,
+            None,
+        )
+        if not hwnd:
+            self._start_error = win_error("CreateWindowExW failed")
+            user32.UnregisterClassW(self._class_name, self._instance)
+            self._ready.set()
+            return
+
+        self._hwnd = hwnd
+        notification_filter = DEV_BROADCAST_DEVICEINTERFACE_W()
+        notification_filter.dbcc_size = ctypes.sizeof(notification_filter)
+        notification_filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE
+        notification_filter.dbcc_classguid = GUID(
+            0xE6F07B5F,
+            0xEE97,
+            0x4A90,
+            (BYTE * 8)(0xB0, 0x76, 0x33, 0xF5, 0x7B, 0xF4, 0xEA, 0xA7),
+        )
+        notification_handle = user32.RegisterDeviceNotificationW(
+            hwnd,
+            ctypes.byref(notification_filter),
+            DEVICE_NOTIFY_WINDOW_HANDLE,
+        )
+        if not notification_handle:
+            self._start_error = win_error("RegisterDeviceNotificationW failed")
+            user32.DestroyWindow(hwnd)
+            self._hwnd = None
+            user32.UnregisterClassW(self._class_name, self._instance)
+            self._ready.set()
+            return
+
+        self._notification_handle = notification_handle
+        self._active.set()
+        self._ready.set()
+
+        message = wintypes.MSG()
+        try:
+            while True:
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result == -1:
+                    raise win_error("Display listener GetMessageW failed")
+                if result == 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        except Exception as exc:
+            self._active.clear()
+            self.on_error(exc)
+        finally:
+            self._active.clear()
+            if self._notification_handle is not None:
+                user32.UnregisterDeviceNotification(self._notification_handle)
+                self._notification_handle = None
+            if self._hwnd is not None:
+                user32.DestroyWindow(self._hwnd)
+                self._hwnd = None
+            if class_registered:
+                user32.UnregisterClassW(self._class_name, self._instance)
+
+    def _window_proc(self, hwnd: wintypes.HWND, msg: int, w_param: int, l_param: int) -> int:
+        if msg == WM_DISPLAYCHANGE or (
+            msg == WM_DEVICECHANGE
+            and w_param in (DBT_DEVNODES_CHANGED, DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE)
+        ):
+            try:
+                self.on_change()
+            except Exception as exc:
+                self.on_error(exc)
+            return 0
+        if msg == WM_DISPLAY_LISTENER_EXIT:
+            user32.DestroyWindow(hwnd)
+            return 0
+        if msg == WM_DESTROY:
+            self._active.clear()
+            self._hwnd = None
+            user32.PostQuitMessage(0)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, w_param, l_param)
 
 
 class TrayIconController:
@@ -512,11 +1028,15 @@ class GlobalVolumeKeyListener:
         should_consume: Callable[[], bool],
         on_error: Callable[[Exception], None],
         step: int,
+        on_unavailable: Callable[[], None] | None = None,
+        should_report_unavailable: Callable[[], bool] | None = None,
     ) -> None:
         self.on_delta = on_delta
         self.should_consume = should_consume
         self.on_error = on_error
         self.step = step
+        self.on_unavailable = on_unavailable
+        self.should_report_unavailable = should_report_unavailable or (lambda: False)
         self._hook_ready = threading.Event()
         self._hook_active = threading.Event()
         self._stop_event = threading.Event()
@@ -526,6 +1046,7 @@ class GlobalVolumeKeyListener:
         self._thread = threading.Thread(target=self._hook_loop, name="volume-key-hook", daemon=True)
         self._hook_callback = HOOKPROC(self._keyboard_proc)
         self._volume_key_consumption: dict[int, bool] = {}
+        self._unavailable_notice_reported = threading.Event()
 
     @property
     def is_active(self) -> bool:
@@ -546,6 +1067,9 @@ class GlobalVolumeKeyListener:
             user32.PostThreadMessageW(self._hook_thread_id, WM_QUIT, 0, 0)
         if self._thread.is_alive():
             self._thread.join(timeout=2)
+
+    def reset_unavailable_notice(self) -> None:
+        self._unavailable_notice_reported.clear()
 
     def _hook_loop(self) -> None:
         self._hook_thread_id = kernel32.GetCurrentThreadId()
@@ -598,6 +1122,17 @@ class GlobalVolumeKeyListener:
 
         return False, None
 
+    def _report_unavailable_key_event(self, message: int, consume: bool) -> None:
+        if (
+            not consume
+            and message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+            and self.on_unavailable is not None
+            and self.should_report_unavailable()
+            and not self._unavailable_notice_reported.is_set()
+        ):
+            self._unavailable_notice_reported.set()
+            self.on_unavailable()
+
     def _keyboard_proc(self, n_code: int, w_param: int, l_param: int) -> int:
         if n_code != HC_ACTION:
             return user32.CallNextHookEx(self._hook_handle, n_code, w_param, l_param)
@@ -609,6 +1144,8 @@ class GlobalVolumeKeyListener:
         consume, delta = self._resolve_volume_key_event(key_info.vkCode, w_param)
         if delta is not None:
             self.on_delta(delta)
+        elif delta is None:
+            self._report_unavailable_key_event(w_param, consume)
 
         if consume:
             return 1

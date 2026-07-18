@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the tagged `0.1.0` runtime and the current repository sources. `windows-ddc` is a small Windows desktop process: Tk owns the UI, native Win32 message loops provide the tray icon and global volume-key hook, and short-lived worker threads perform DDC/CI operations against physical monitors.
+This document describes the tagged `0.1.0` release and the current repository sources. `windows-ddc` is a small Windows desktop process: Tk owns the UI, native Win32 message loops provide display-change protection, the tray icon, and the global volume-key hook, and short-lived workers perform DDC/CI operations against physical monitors.
 
 There is no server-side tier. The project has no HTTP API, listening port, database, container, service, authentication system, broker, cron process, telemetry client, or runtime network dependency.
 
@@ -9,14 +9,15 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 1. The supported entrypoint, `app.py`, creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()`.
 2. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference and loads a saved monitor selection from `settings.py`.
 3. It builds the fixed-size control window, status bar, and hidden `overlay.VolumeOverlay` on the Tk thread.
-4. It attempts to start `windows_platform.TrayIconController`. On success, the application posts an icon-add request and withdraws the Tk window. A synchronous tray-start failure is reported in the still-visible window and startup continues without tray-first hiding.
-5. It independently attempts to start `windows_platform.GlobalVolumeKeyListener`, which installs a desktop-wide low-level keyboard hook on its own message-loop thread. Hook-start failure is reported and startup continues without a listener. Both native `start()` calls wait on readiness events without a timeout.
-6. It schedules two Tk callbacks after 50 ms: the recurring cross-thread queue poll and a one-shot initial monitor refresh.
-7. The refresh worker enumerates DDC/CI monitors, chooses the saved selection or the first monitor, and reads that monitor's current volume.
+4. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
+5. It independently starts the tray controller and global keyboard hook. Their failures remain nonfatal to the other subsystems.
+6. It schedules the recurring Tk queue poll and a one-shot initial monitor refresh after 50 ms.
+7. The refresh worker enumerates DDC wrappers and Windows monitor identities, exact-matches the saved target, and reads its volume. With no saved selection, automatic selection occurs only when exactly one verifiable monitor exists.
 8. The worker enqueues a completion callback. The Tk queue poll applies the monitor list, selection, displayed volume, readiness, and status text.
-9. A button, slider release, or intercepted volume-key event computes a clamped target, updates the UI optimistically, displays the overlay, and starts a serialized DDC set/readback worker.
-10. The readback becomes authoritative. Any requests accumulated during the active write are reduced to the most recent target and executed next.
-11. Shutdown disables key consumption, cancels Tk timers, stops the hook and tray loops, closes the overlay, and finally destroys the Tk root.
+9. A volume request updates the UI optimistically, then a serialized worker reacquires all wrappers and exact-matches the identity before set/readback.
+10. The readback becomes authoritative. A coalesced follow-up starts another worker and therefore performs another fresh discovery/match.
+11. Display/device notifications invalidate a thread-safe topology generation immediately, release key consumption, clear pending writes, and schedule debounced discovery with bounded retries.
+12. Shutdown disables key consumption, cancels Tk timers, stops display/hook/tray loops, closes the overlay, and destroys Tk.
 
 ## Runtime process and thread ownership
 
@@ -25,6 +26,7 @@ Source execution uses one interactive process. The one-file Nuitka executable ad
 | Thread | Lifetime | Owns or performs | Communication boundary |
 | --- | --- | --- | --- |
 | Tk main thread | Process lifetime | Widgets, state mutation, selection persistence, status, overlay, queue draining | Receives queued callables and key deltas every 50 ms |
+| `display-change-listener` | Long-lived daemon | Hidden Win32 window, monitor device registration, `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` message pump | Invalidates the topology generation and enqueues Tk work |
 | `tray-icon` | Long-lived daemon | Hidden Win32 window, notification icon, native menu, message pump | Controller callbacks enqueue Tk work through `_post_to_ui()` |
 | `volume-key-hook` | Long-lived daemon | `WH_KEYBOARD_LL` hook and message pump | Reads readiness through `should_consume()` and enqueues integer deltas |
 | `ddc-gui-worker` | One short-lived daemon per accepted refresh/selection read | Enumeration and selected-monitor volume reads | Enqueues success or failure callable |
@@ -34,7 +36,7 @@ Source execution uses one interactive process. The one-file Nuitka executable ad
 
 The `_busy` flag prevents a new refresh/selection worker while another general operation is active. Volume controls remain usable during an active volume write, but they update `_pending_target_volume` rather than starting another DDC worker. This is the application's serialization boundary; there is no separate DDC lock.
 
-Tray and hook threads are explicitly stopped and joined with two-second timeouts. DDC workers are daemon threads and are not cancelled or joined; `_closing` causes their eventual callbacks to be dropped.
+Display, tray, and hook threads are explicitly stopped and joined with two-second timeouts. DDC workers are daemon threads and are not cancelled or joined; `_closing` drops their eventual callbacks.
 
 All Tk calls must remain on the Tk thread. A native or DDC thread must enqueue work rather than touching widgets. Queued callbacks also need to remain exception-safe: `_poll_queues()` does not wrap each callback, so an exception can prevent the next poll from being scheduled.
 
@@ -66,9 +68,9 @@ Keeping composition here makes `gui.py` responsible for application behavior wit
 | `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, persistence calls, tray lifecycle, and shutdown. |
 | `ddc.py` | Defines `MonitorRef`, selection identity, monitor discovery, clamping, and DDC read/change/write wrappers. |
 | `settings.py` | Loads and replaces the selected-monitor JSON file. |
-| `overlay.py` | Implements the topmost, transient volume overlay. |
+| `overlay.py` | Implements topmost transient volume and unavailable/error presentations. |
 | `theme.py` | Samples the Windows theme, defines ttk dark styling, applies DWM dark chrome, and resolves the icon. |
-| `windows_platform.py` | Declares the Win32 ctypes ABI and implements tray, keyboard-hook, and DWM helpers. |
+| `windows_platform.py` | Declares the Win32 ctypes ABI and implements monitor identity/EDID inventory, display notifications, tray, keyboard-hook, and DWM helpers. |
 | `main.py` | Rejects the old launch path. |
 
 `ddc.change_monitor_volume()` is an internal helper but is not used by the GUI. The GUI uses its own cached-target and serialized-write flow so rapid key events can be coalesced.
@@ -90,18 +92,19 @@ Application code never touches a raw physical-monitor handle; the dependency own
 
 ### `MonitorRef` and selection identity
 
-Each discovery result becomes an immutable `ddc.MonitorRef` with:
+Each immutable `MonitorRef` retains the transient index, monitorcontrol wrapper, description/ordinal, short GDI display name, and optional `MonitorIdentity`. The combobox adds `S/N <serial>` when usable, otherwise the short `DISPLAYn` name; the full device-interface path remains internal.
 
-- `index`: one-based position in the current enumeration;
-- `monitor`: the external monitorcontrol wrapper;
-- `description`: `monitor.vcp.description`, trimmed, or `Unnamed monitor`;
-- `description_ordinal`: one-based occurrence of that description in this enumeration.
+`enumerate_monitors()` takes a Windows identity snapshot before and after `get_monitors()`. Identity enumeration follows the same `EnumDisplayMonitors` traversal, maps a one-physical-monitor/one-active-interface logical display, reads EDID through SetupAPI, and returns no identity for ambiguous mappings. A changed snapshot or wrapper/identity count mismatch rejects the discovery.
 
-The UI label is `"<index>. <description>"`. The persistent selection key is `(description, description_ordinal)`. The display index is deliberately not durable.
+Stable matching follows these rules:
 
-This identity avoids immediate ambiguity when two monitors report the same description, but it is not stable hardware identity. Port, topology, or enumeration-order changes can cause the same key to resolve to another identical monitor. There is no EDID or serial-number matching.
+1. A unique normalized EDID manufacturer/product/serial tuple matches across device-path changes.
+2. Duplicate serial tuples require an exact case-insensitive saved device path.
+3. A monitor without a usable serial requires its exact saved device path.
+4. Missing, ambiguous, and unverifiable targets never fall back to another monitor.
+5. With no saved target, only one verifiable monitor can be selected automatically.
 
-`pick_selected_monitor_index()` returns the saved match, otherwise the first monitor, otherwise `None`. The GUI persists the chosen key before proving that the selected monitor supports a volume read. An absent saved monitor therefore causes the first enumerated monitor to become the new saved choice.
+Legacy description/ordinal settings are loaded, but the ordinal is not trusted after topology changes. A legacy description promotes only when exactly one verifiable current monitor has that description. Selection is persisted only after a successful volume read.
 
 ### Read and write semantics
 
@@ -111,7 +114,7 @@ All volume targets and readbacks exposed by `ddc.py` are clamped to `0`–`100`.
 - `set_monitor_volume()` opens one context, writes the clamped target, immediately reads it back, and returns the clamped readback.
 - `change_monitor_volume()` reads, adds the requested delta, clamps the resulting target, writes only when the value changes, then reads back.
 
-The set/readback sequence is not a database transaction and has no rollback. A write can reach the monitor and the subsequent read can fail. In that case the GUI's error path restores its previous cached display value even though the hardware may already have changed.
+The set/readback sequence is not a transaction and has no rollback. A write can reach the monitor before readback or topology validation fails. The GUI then marks volume unknown, disables control, reports uncertainty in the overlay/status, and performs read-only rediscovery without retrying the write.
 
 Application clamping defines the UI range; it does not prove that every device accepts every target. For example, the pinned dependency can raise `ValueError` when a monitor reports a maximum below the requested value. Such non-`VCPError` exceptions cross the generic GUI worker boundary and their message is shown in the status bar.
 
@@ -132,12 +135,13 @@ A request follows this sequence:
 2. The scale/text are updated optimistically and the overlay is shown immediately.
 3. If a write is active, only `_pending_target_volume` is replaced.
 4. Otherwise `_start_volume_write()` marks the app busy and launches `ddc-volume-write`.
-5. `set_monitor_volume()` performs the hardware set and readback inside one context.
-6. Success updates `current_volume`. If the latest pending target differs and the same selection remains active, the next worker starts without clearing the operation slot.
-7. When no distinct follow-up is needed, confirmed state is displayed, the overlay is shown again with the readback (resetting its 1.4-second timer), and controls return to the normal ready state. An equal pending value can remain stored until `_start_volume_write()` clears it at the beginning of the next write, but it is not acted on.
-8. Failure clears the pending target and busy/write flags, marks confirmed and target volume unknown, displays `--`, hides the optimistic overlay, clears hotkey readiness, and reports that Refresh is required. The native hook immediately passes subsequent physical volume-key presses back to Windows.
+5. The worker calls `enumerate_monitors()`, exact-matches the saved identity, and checks its captured topology generation immediately before the write.
+6. `set_monitor_volume()` performs set/readback only through the newly acquired wrapper and inside one context.
+7. Success is accepted only if the generation remains current. A distinct pending target starts another worker and another discovery/match.
+8. When no follow-up remains, confirmed readback is displayed and readiness is restored.
+9. Missing/ambiguous identity, DDC failure, or a stale generation clears pending state, marks volume unknown, releases interception, shows an unavailable overlay, and schedules read-only rediscovery.
 
-This last-target-wins design limits DDC traffic during key repeat while keeping the UI responsive. Replacing it with a worker per key event would introduce concurrent hardware access and stale completion ordering.
+This last-target-wins design limits DDC traffic while ensuring every actual hardware write—not every key-repeat message—uses fresh handles. An in-flight native DDC call cannot be cancelled; generation checks reduce but cannot remove the final check-to-write race.
 
 ## Global keyboard event flow
 
@@ -148,7 +152,7 @@ The callback passes unrelated keys directly to `CallNextHookEx`. It recognizes o
 - `VK_VOLUME_DOWN` (`0xAE`)
 - `VK_VOLUME_UP` (`0xAF`)
 
-When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys are also passed onward. On the first key-down of a physical press, the hook records whether that press should be consumed. Repeated key-down and the matching key-up retain that decision even if readiness changes mid-press. A consumed repeat enqueues a `-1` or `+1` delta only while readiness remains active; after readiness loss it remains consumed without producing more DDC requests until release. The mute key is not recognized.
+When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys pass onward. If a previously configured target is unavailable, the first key-down in that invalid period also queues an error overlay without consuming the event. The notice is latched until readiness is restored or a new invalidation begins. On a consumed press, repeated key-down and matching key-up retain the initial consume decision; readiness loss stops new deltas but does not split a press between the app and Windows. The mute key is not recognized.
 
 The callback does not inspect the `KBDLLHOOKSTRUCT.flags` injection bits. Synthesized Volume Down/Up events are therefore handled like physical-key events.
 
@@ -157,6 +161,8 @@ The callback does not inspect the `KBDLLHOOKSTRUCT.flags` injection bits. Synthe
 ```text
 `_hotkeys_ready` is true
 AND app not closing
+AND the display-change listener is live
+AND the topology generation is valid
 AND the listener exists and its native hook is active
 AND selected key exists
 AND confirmed current volume exists
@@ -164,7 +170,11 @@ AND confirmed current volume exists
 
 `_hotkeys_ready` is application/DDC state set after successful selected-volume reads or write readbacks. Native hook liveness is tracked independently by `GlobalVolumeKeyListener.is_active`; `_should_consume_volume_keys()` rechecks both the computed state and live listener state at callback time.
 
-There is no user preference to disable the hook while leaving the app running. A write failure clears `current_volume`, `target_volume`, and `_hotkeys_ready`, so a disconnected or stale target releases subsequent physical key presses until a successful Refresh. A hook-start or runtime failure also prevents `_hotkeys_enabled` from becoming true even if later DDC reads succeed. If readiness is lost during an already-consumed press, that press remains consumed through key-up to avoid splitting one physical press between the monitor and Windows.
+There is no user preference to disable the hook while leaving the app running. Display invalidation or write failure clears readiness so subsequent physical presses pass through until exact-match rediscovery and a successful read. A hook failure disables only global interception; a display-listener failure disables all monitor-volume writes.
+
+## Display-change event flow
+
+`DisplayChangeListener` owns a separate hidden window registered for `GUID_DEVINTERFACE_MONITOR`. `WM_DISPLAYCHANGE` and relevant `WM_DEVICECHANGE` messages synchronously clear a thread-safe topology-valid event and increment a generation before posting Tk work. Tk then clears cached/pending volume state and schedules a 500 ms debounced refresh; transient automatic failures retry after 1, 2, and 4 seconds. Callbacks do no blocking discovery or Tk work on the native thread.
 
 ## Tray and window event flow
 
@@ -183,7 +193,7 @@ Minimizing a visible Tk window schedules an idle check and withdraws it only if 
 
 ## Frontend and overlay
 
-The control window is a non-resizable Tk/ttk layout at least 440 pixels wide. It contains:
+The control window is a non-resizable Tk/ttk layout at least 520 pixels wide so serial-bearing monitor labels remain readable. It contains:
 
 - a read-only monitor combobox;
 - Refresh;
@@ -191,9 +201,9 @@ The control window is a non-resizable Tk/ttk layout at least 440 pixels wide. It
 - one-point decrement/increment buttons;
 - a percentage label and status bar.
 
-Widget state derives from `_busy`, monitor availability, and confirmed volume. During an active write the volume controls remain enabled so a new last target can be queued.
+Widget state derives from `_busy`, monitor availability, confirmed volume, display-listener liveness, and topology validity. During a valid active write the volume controls remain enabled so a new last target can be queued.
 
-`VolumeOverlay` is a borderless tool `Toplevel` with fixed dark colors and a progress bar. Topmost, alpha `0.7`, and tool-window attributes are best-effort because `TclError` is ignored. It is independent of the main light/dark theme and hides after `AUTO_HIDE_MS = 1400`. Positioning uses Tk's primary-screen dimensions: horizontal centering clamped to at least 24 pixels from the left, and 88 pixels above the screen bottom clamped to at least 32 pixels from the top. It is not selected-monitor-aware, work-area-aware, or explicitly DPI-aware.
+`VolumeOverlay` is a borderless tool `Toplevel` with fixed dark colors. Normal mode shows percentage/progress and hides after 1.4 seconds. Error mode shows a red `Unavailable` heading plus wrapped reason text, hides the progress bar, and remains for 2.8 seconds. Topmost, alpha `0.7`, and tool-window attributes are best-effort because `TclError` is ignored. Positioning still uses Tk's primary-screen dimensions and is not selected-monitor/work-area/DPI aware.
 
 `theme.is_windows_dark_mode_enabled()` reads the current user's:
 
@@ -203,7 +213,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTh
 
 Only a DWORD value of `0` selects dark mode. The preference is sampled once at startup. Dark mode creates a custom ttk theme and tries DWM attributes `20` then `19`; light mode prefers `vista`, `xpnative`, then `winnative` when available. The registry is read-only.
 
-The real UI screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). There is no automated screenshot workflow.
+The manually maintained screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). They predate the wider identity selector and error presentation; there is no automated screenshot workflow, so updates require real scrubbed captures.
 
 ## Persistent data and filesystem ownership
 
@@ -223,16 +233,22 @@ It inherits the current user's filesystem permissions. The schema is:
 
 ```json
 {
+  "schema_version": 2,
   "selected_monitor": {
     "description": "physical monitor description",
-    "ordinal": 1
+    "identity": {
+      "device_path": "Windows monitor interface path",
+      "manufacturer_id": "DEL",
+      "product_code": 4660,
+      "serial_number": "EXAMPLE-SERIAL"
+    }
   }
 }
 ```
 
-`save_selected_monitor_key()` creates the parent directories, writes indented UTF-8 JSON to sibling `settings.tmp`, and replaces `settings.json`. This reduces exposure to a partially written destination but does not coordinate multiple processes; instances share both paths. An interrupted or failed replacement can leave `settings.tmp`, and there is no cleanup path. The GUI deliberately ignores `OSError` from saving, so persistence failure is not visible in the status bar.
+`save_selected_monitor_key()` requires a stable identity, creates the parent directories, writes indented UTF-8 JSON to sibling `settings.tmp`, and replaces `settings.json`. This reduces exposure to a partial destination but does not coordinate multiple processes; instances share both paths. Persistence failure is not visible in the status bar.
 
-There is no schema version or migration history. Missing files, I/O failures, invalid JSON syntax, and invalid nested selection objects return no saved selection. A valid JSON top-level scalar or array currently reaches `data.get(...)` and raises `AttributeError` during application construction. The writer emits a numeric integer ordinal, but the loader's `isinstance(ordinal, int)` check also accepts JSON `true` as ordinal `1` because Python's `bool` is an `int` subclass.
+The writer emits schema version 2. The loader accepts the old unversioned description/ordinal shape for safe one-time promotion, rejects boolean ordinals, and treats missing files, I/O failures, invalid JSON, non-object roots, unknown versions, and invalid nested data as no selection.
 
 The monitor's actual volume is external mutable hardware state, not app storage. The app reads it after discovery or selection and never backs it up or restores it on exit.
 
@@ -252,7 +268,7 @@ The security-relevant boundaries are local:
 2. **Physical hardware writes.** DDC/CI writes change monitor state and may produce an audible volume change. They are neither transactional nor rolled back.
 3. **Native ABI.** Incorrect ctypes structures, argument types, callback signatures, or callback lifetimes can corrupt or crash the process.
 4. **Cross-thread UI.** Tk is not thread-safe; queues are the required ownership boundary.
-5. **Per-user file.** Settings are user-writable, unencrypted, and unversioned, but contain only a monitor description and ordinal.
+5. **Per-user file.** Settings are user-writable and unencrypted, but contain only monitor identity metadata; a device-interface path is machine-specific but is not a credential.
 
 Runtime code has no network path. Dependency installation and Nuitka's `--assume-yes-for-downloads` build can contact external package/toolchain servers; these are development/build effects, not application runtime behavior.
 
@@ -289,7 +305,7 @@ Ignored `windows_ddc.egg-info\` is setuptools-generated residue, not source of t
 
 ## Background activity and absent subsystems
 
-The tray and hook message pumps are event loops, and DDC workers are background threads, but there are no scheduled jobs, periodic monitor polls, job queues, retry workers, or durable events. Initial discovery is a one-shot scheduled callback; subsequent discovery happens only when the user activates Refresh.
+Display, tray, and hook message pumps are event loops, and DDC workers are background threads. There is no periodic monitor or volume poll. Display notifications schedule a 500 ms debounced refresh and at most three retry timers; manual Refresh and every actual write also perform discovery. There are no durable events, job queues, or cron-style tasks.
 
 There is likewise no web frontend/backend split, API request flow, database schema, migration procedure, realtime protocol, authentication provider, health endpoint, readiness probe, liveness probe, or external service integration to operate.
 
@@ -304,12 +320,12 @@ The status bar is the only normal health surface:
 
 The packaged executable disables its console, and no file logger exists. If the main window is withdrawn, a tray failure can also hide the only error surface.
 
-Volume-control readiness requires monitors plus a confirmed volume. Key-consumption readiness additionally requires an active native listener. A refresh clears `_hotkeys_ready` while it runs and restores it after a successful read. A write failure marks the volume unknown and also requires Refresh before monitor control resumes. There is no automatic retry after topology changes and no live reconciliation with volume changes from the monitor OSD or another tool.
+Volume-control readiness requires a live display listener, valid topology generation, unique selected identity, and confirmed volume. Key-consumption readiness additionally requires an active keyboard hook. Refresh clears readiness while it runs and restores it only after an exact match and successful read. Topology and write failures trigger bounded automatic rediscovery; external OSD/tool volume changes are not reconciled automatically.
 
 Known failure-state caveats include:
 
-- a stale/hotplug target is detected only when the user invokes Refresh or an attempted DDC operation fails;
-- the physical key press that discovers a stale target remains consumed through its release, while subsequent presses pass through;
+- an in-flight native DDC call cannot be cancelled, so a topology event can race with the final pre-write generation check;
+- if Windows emits no notification before a first post-change press, that press can be consumed while asynchronous revalidation rejects the write; subsequent presses pass through;
 - tray/icon loss can strand a withdrawn main window;
 - `start()` waits on native readiness events without a timeout;
 - a set may succeed before its readback fails;
@@ -317,7 +333,7 @@ Known failure-state caveats include:
 
 ## Development and testing
 
-The repository contains a small standard-library unit-test suite for fail-safe hotkey state and key-event pairing. It has no third-party test framework configuration, linter, formatter, type checker, or CI workflow. Low-risk validation consists of that suite, Python compilation, an installed-dependency check, PowerShell parsing, tracked/staged diff whitespace checks, and explicit status review; exact commands are in `README.md` and `AGENTS.md`.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, topology generations, display-message routing, and fresh-wrapper writes. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 
@@ -330,8 +346,8 @@ An authorized manual Windows/hardware pass is required for changes to discovery,
 - Keep DDC work off Tk and serialize/coalesce writes. Do not start one hardware worker per key event.
 - Keep monitorcontrol operations inside the monitor context manager and clamp all public volume results/targets to `0`–`100`.
 - Preserve system key pass-through until a selected monitor has a successful volume read, and clear/pass through safely on loss of readiness.
-- Keep native ctypes callbacks strongly referenced and stop hook/tray loops before destroying Tk.
-- Do not use the displayed monitor index as persistent identity. Any identity/schema change needs backward-compatible loading or an explicit migration.
+- Keep native ctypes callbacks strongly referenced and stop display/hook/tray loops before destroying Tk.
+- Do not use the displayed index or description ordinal as current persistent identity. Preserve version-2 matching and backward-compatible legacy loading.
 - Never touch live per-user settings in automated work; use a temporary path.
 - Treat physical monitor volume and global keyboard handling as safety-sensitive side effects.
 - Keep `[tool.setuptools].py-modules` synchronized when distributable runtime modules are added, renamed, or removed.

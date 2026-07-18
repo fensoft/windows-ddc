@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import settings
+from ddc import (
+    DDCError,
+    MonitorIdentity,
+    MonitorRef,
+    SavedMonitorSelection,
+    SelectionMatchStatus,
+    enumerate_monitors,
+    match_selected_monitor,
+)
+from windows_platform import parse_edid_identity
+
+
+class FakeVCP:
+    def __init__(self, description: str) -> None:
+        self.description = description
+
+
+class FakeMonitor:
+    def __init__(self, description: str) -> None:
+        self.vcp = FakeVCP(description)
+
+
+def make_ref(
+    index: int,
+    description: str,
+    identity: MonitorIdentity | None,
+) -> MonitorRef:
+    return MonitorRef(
+        index=index,
+        monitor=FakeMonitor(description),
+        description=description,
+        description_ordinal=1,
+        identity=identity,
+        display_device_name=rf"\\.\DISPLAY{index}",
+    )
+
+
+def make_edid(
+    manufacturer: str = "DEL",
+    product_code: int = 0x1234,
+    numeric_serial: int = 0,
+    descriptor_serial: str | None = None,
+) -> bytes:
+    edid = bytearray(128)
+    edid[:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+    manufacturer_value = 0
+    for letter in manufacturer:
+        manufacturer_value = (manufacturer_value << 5) | (ord(letter) - ord("A") + 1)
+    edid[8:10] = manufacturer_value.to_bytes(2, "big")
+    edid[10:12] = product_code.to_bytes(2, "little")
+    edid[12:16] = numeric_serial.to_bytes(4, "little")
+    if descriptor_serial is not None:
+        encoded = descriptor_serial.encode("ascii")[:13].ljust(13, b" ")
+        edid[54:72] = b"\x00\x00\x00\xff\x00" + encoded
+    return bytes(edid)
+
+
+class EDIDTests(unittest.TestCase):
+    def test_text_serial_is_preferred_and_normalized(self) -> None:
+        self.assertEqual(
+            parse_edid_identity(make_edid(numeric_serial=123, descriptor_serial=" ab-c12\n")),
+            ("DEL", 0x1234, "AB-C12"),
+        )
+
+    def test_numeric_serial_is_used_when_text_is_missing(self) -> None:
+        self.assertEqual(
+            parse_edid_identity(make_edid(numeric_serial=123456)),
+            ("DEL", 0x1234, "123456"),
+        )
+
+    def test_placeholder_and_malformed_serials_are_absent(self) -> None:
+        self.assertEqual(
+            parse_edid_identity(make_edid(numeric_serial=0, descriptor_serial="00000000")),
+            ("DEL", 0x1234, None),
+        )
+        self.assertEqual(parse_edid_identity(b"not-edid"), (None, None, None))
+
+
+class SelectionMatchingTests(unittest.TestCase):
+    def test_unique_serial_follows_monitor_to_a_new_device_path(self) -> None:
+        saved = SavedMonitorSelection(
+            "Monitor",
+            MonitorIdentity("old-path", "DEL", 1, "SERIAL-A"),
+        )
+        monitors = [
+            make_ref(1, "Monitor", MonitorIdentity("new-path", "DEL", 1, "SERIAL-A")),
+        ]
+        match = match_selected_monitor(monitors, saved)
+        self.assertEqual((match.status, match.index), (SelectionMatchStatus.FOUND, 0))
+
+    def test_duplicate_serial_requires_the_saved_device_path(self) -> None:
+        saved = SavedMonitorSelection(
+            "Monitor",
+            MonitorIdentity("path-b", "DEL", 1, "DUPLICATE"),
+        )
+        monitors = [
+            make_ref(1, "Monitor", MonitorIdentity("path-a", "DEL", 1, "DUPLICATE")),
+            make_ref(2, "Monitor", MonitorIdentity("path-b", "DEL", 1, "DUPLICATE")),
+        ]
+        match = match_selected_monitor(monitors, saved)
+        self.assertEqual((match.status, match.index), (SelectionMatchStatus.FOUND, 1))
+
+        moved = SavedMonitorSelection(
+            "Monitor",
+            MonitorIdentity("missing-path", "DEL", 1, "DUPLICATE"),
+        )
+        self.assertEqual(
+            match_selected_monitor(monitors, moved).status,
+            SelectionMatchStatus.AMBIGUOUS,
+        )
+
+    def test_no_serial_requires_an_exact_case_insensitive_path(self) -> None:
+        saved = SavedMonitorSelection("Monitor", MonitorIdentity("DEVICE-PATH"))
+        monitors = [make_ref(1, "Monitor", MonitorIdentity("device-path"))]
+        self.assertEqual(match_selected_monitor(monitors, saved).index, 0)
+
+        missing = SavedMonitorSelection("Monitor", MonitorIdentity("another-path"))
+        self.assertEqual(
+            match_selected_monitor(monitors, missing).status,
+            SelectionMatchStatus.MISSING,
+        )
+
+    def test_legacy_description_promotes_only_when_unique(self) -> None:
+        legacy = SavedMonitorSelection("Monitor", legacy_ordinal=2)
+        unique = [make_ref(1, "Monitor", MonitorIdentity("path-a"))]
+        match = match_selected_monitor(unique, legacy)
+        self.assertEqual(match.status, SelectionMatchStatus.FOUND)
+        self.assertTrue(match.should_promote_legacy)
+
+        duplicate = unique + [make_ref(2, "Monitor", MonitorIdentity("path-b"))]
+        self.assertEqual(
+            match_selected_monitor(duplicate, legacy).status,
+            SelectionMatchStatus.AMBIGUOUS,
+        )
+
+    def test_unverifiable_identity_and_multi_monitor_first_run_fail_closed(self) -> None:
+        unverifiable = [make_ref(1, "Monitor", None)]
+        self.assertEqual(
+            match_selected_monitor(unverifiable, None).status,
+            SelectionMatchStatus.UNVERIFIABLE,
+        )
+
+        single = [make_ref(1, "Monitor", MonitorIdentity("path-a"))]
+        self.assertEqual(match_selected_monitor(single, None).index, 0)
+
+        multiple = [
+            make_ref(1, "A", MonitorIdentity("path-a")),
+            make_ref(2, "B", MonitorIdentity("path-b")),
+        ]
+        self.assertEqual(
+            match_selected_monitor(multiple, None).status,
+            SelectionMatchStatus.NEEDS_SELECTION,
+        )
+
+    def test_discovery_rejects_an_identity_snapshot_change(self) -> None:
+        fake_monitor = FakeMonitor("Monitor")
+        identity_a = object()
+        identity_b = object()
+        with patch("ddc.get_monitors", return_value=[fake_monitor]), patch(
+            "ddc.enumerate_windows_monitor_identities",
+            side_effect=[[identity_a], [identity_b]],
+        ):
+            with self.assertRaisesRegex(DDCError, "Display configuration changed"):
+                enumerate_monitors()
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.settings_path = Path(self.temp_dir.name) / "settings.json"
+        self.path_patch = patch.object(settings, "SETTINGS_PATH", self.settings_path)
+        self.path_patch.start()
+        self.addCleanup(self.path_patch.stop)
+
+    def write_json(self, value: object) -> None:
+        self.settings_path.write_text(json.dumps(value), encoding="utf-8")
+
+    def test_schema_v2_round_trip(self) -> None:
+        selection = SavedMonitorSelection(
+            description="Monitor",
+            identity=MonitorIdentity("device-path", "DEL", 0x1234, "SERIAL-A"),
+        )
+        settings.save_selected_monitor_key(selection)
+        self.assertEqual(settings.load_selected_monitor_key(), selection)
+        payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema_version"], 2)
+
+    def test_legacy_settings_load_but_boolean_ordinal_does_not(self) -> None:
+        self.write_json({"selected_monitor": {"description": "Monitor", "ordinal": 2}})
+        self.assertEqual(
+            settings.load_selected_monitor_key(),
+            SavedMonitorSelection("Monitor", legacy_ordinal=2),
+        )
+
+        self.write_json({"selected_monitor": {"description": "Monitor", "ordinal": True}})
+        self.assertIsNone(settings.load_selected_monitor_key())
+
+    def test_non_object_unknown_and_malformed_values_are_absent(self) -> None:
+        self.assertIsNone(settings.load_selected_monitor_key())
+        self.settings_path.write_text("{not-json", encoding="utf-8")
+        self.assertIsNone(settings.load_selected_monitor_key())
+
+        for value in ([], "text", 1, True, None):
+            with self.subTest(value=value):
+                self.write_json(value)
+                self.assertIsNone(settings.load_selected_monitor_key())
+
+        self.write_json(
+            {
+                "schema_version": 99,
+                "selected_monitor": {"description": "Monitor", "ordinal": 1},
+            }
+        )
+        self.assertIsNone(settings.load_selected_monitor_key())
+
+        self.write_json(
+            {
+                "schema_version": 2,
+                "selected_monitor": {"description": "Monitor", "identity": []},
+            }
+        )
+        self.assertIsNone(settings.load_selected_monitor_key())
+
+    def test_stable_identity_is_required_for_saving(self) -> None:
+        with self.assertRaises(ValueError):
+            settings.save_selected_monitor_key(
+                SavedMonitorSelection("Monitor", legacy_ordinal=1)
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

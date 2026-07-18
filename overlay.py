@@ -9,8 +9,10 @@ OVERLAY_BORDER = "#2A2A2A"
 OVERLAY_TEXT = "#FFFFFF"
 OVERLAY_SUBTEXT = "#D0D0D0"
 OVERLAY_ACCENT = "#4CC2FF"
+OVERLAY_ERROR = "#FF6B6B"
 OVERLAY_TRACK = "#2A2A2A"
 AUTO_HIDE_MS = 1400
+ERROR_AUTO_HIDE_MS = 2800
 PROGRESS_STYLE = "VolumeOverlay.Horizontal.TProgressbar"
 OVERLAY_BOTTOM_MARGIN = 88
 OVERLAY_SIDE_MARGIN = 24
@@ -20,6 +22,7 @@ OVERLAY_LABEL_FONT = ("Segoe UI", 9)
 OVERLAY_VALUE_FONT = ("Segoe UI", 20, "bold")
 OVERLAY_BAR_LENGTH = 176
 OVERLAY_BAR_THICKNESS = 5
+OVERLAY_ERROR_WRAP = 240
 
 
 class VolumeOverlay:
@@ -46,7 +49,9 @@ class VolumeOverlay:
         except tk.TclError:
             pass
 
+        self.title_var = tk.StringVar(value="Volume")
         self.volume_var = tk.StringVar(value="0%")
+        self.error_var = tk.StringVar(value="")
 
         border = tk.Frame(self.window, bg=OVERLAY_BORDER, bd=0, highlightthickness=0)
         border.pack()
@@ -54,21 +59,33 @@ class VolumeOverlay:
         content = tk.Frame(border, bg=OVERLAY_BG, padx=OVERLAY_CONTENT_PADX, pady=OVERLAY_CONTENT_PADY)
         content.pack(padx=1, pady=1)
 
-        tk.Label(
+        self.title_label = tk.Label(
             content,
-            text="Volume",
+            textvariable=self.title_var,
             bg=OVERLAY_BG,
             fg=OVERLAY_SUBTEXT,
             font=OVERLAY_LABEL_FONT,
-        ).pack(anchor="w")
+        )
+        self.title_label.pack(anchor="w")
 
-        tk.Label(
+        self.value_label = tk.Label(
             content,
             textvariable=self.volume_var,
             bg=OVERLAY_BG,
             fg=OVERLAY_TEXT,
             font=OVERLAY_VALUE_FONT,
-        ).pack(anchor="w", pady=(1, 8))
+        )
+        self.value_label.pack(anchor="w", pady=(1, 8))
+
+        self.error_label = tk.Label(
+            content,
+            textvariable=self.error_var,
+            bg=OVERLAY_BG,
+            fg=OVERLAY_TEXT,
+            font=OVERLAY_LABEL_FONT,
+            justify="left",
+            wraplength=OVERLAY_ERROR_WRAP,
+        )
 
         self.progress = ttk.Progressbar(
             content,
@@ -93,8 +110,27 @@ class VolumeOverlay:
 
     def show(self, volume: int) -> None:
         volume = max(0, min(volume, 100))
+        self.title_var.set("Volume")
         self.volume_var.set(f"{volume}%")
+        self.value_label.configure(fg=OVERLAY_TEXT)
+        self.error_var.set("")
+        self.error_label.pack_forget()
+        if not self.progress.winfo_manager():
+            self.progress.pack(fill="x")
         self.progress.configure(value=volume)
+        self._show_window(AUTO_HIDE_MS)
+
+    def show_error(self, message: str) -> None:
+        self.title_var.set("Monitor volume")
+        self.volume_var.set("Unavailable")
+        self.value_label.configure(fg=OVERLAY_ERROR)
+        self.error_var.set(message.strip() or "Selected monitor is unavailable.")
+        self.progress.pack_forget()
+        if not self.error_label.winfo_manager():
+            self.error_label.pack(anchor="w")
+        self._show_window(ERROR_AUTO_HIDE_MS)
+
+    def _show_window(self, auto_hide_ms: int) -> None:
         self._position_window()
         self.window.deiconify()
         self.window.lift()
@@ -105,7 +141,7 @@ class VolumeOverlay:
 
         if self._hide_after_id is not None:
             self.window.after_cancel(self._hide_after_id)
-        self._hide_after_id = self.window.after(AUTO_HIDE_MS, self.hide)
+        self._hide_after_id = self.window.after(auto_hide_ms, self.hide)
 
     def _position_window(self) -> None:
         self.window.update_idletasks()

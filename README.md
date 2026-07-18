@@ -14,15 +14,18 @@ It controls the monitor's DDC/CI audio-volume value, not the Windows audio mixer
 
 ![On-screen monitor volume overlay](docs/overlay.png)
 
+These manually maintained captures predate the wider serial-bearing selector and the new unavailable/error overlay. Update them only from a real application capture on compatible hardware.
+
 ## Features
 
 - Discovers DDC/CI monitors and lets the user select one target.
 - Reads and writes the selected monitor's volume in the `0`–`100` range.
 - Provides a slider and `-`/`+` buttons with one-point steps.
 - Intercepts the global Windows Volume Down and Volume Up keys only while the native hook is live and a target is ready.
-- Shows a bottom-centered overlay with best-effort topmost placement and a 1.4-second timer after the most recent overlay update.
+- Shows volume and fail-closed monitor errors in a bottom-centered, best-effort topmost overlay.
 - Starts in the Windows notification area, with Restore and Exit actions.
-- Remembers the selected monitor across launches.
+- Remembers the selected physical monitor by EDID manufacturer/product/serial when available, with a Windows device-path fallback.
+- Invalidates monitor control on Windows display/device notifications and reacquires fresh DDC handles before every actual write.
 - Follows the current user's Windows light/dark application preference at startup.
 - Keeps DDC/CI work off Tk's UI thread and coalesces rapid volume changes.
 
@@ -35,7 +38,7 @@ It controls the monitor's DDC/CI audio-volume value, not the Windows audio mixer
 | --- | --- |
 | User interface | Python `tkinter` / `ttk` |
 | Monitor control | `monitorcontrol==4.2.0` over DDC/CI |
-| Windows integration | `ctypes` calls to User32, Kernel32, Shell32, and optional DWM APIs |
+| Windows integration | `ctypes` calls to User32, Kernel32, Shell32, Dxva2, SetupAPI, Advapi32, and optional DWM APIs |
 | Source packaging | setuptools with flat `py-modules` |
 | Executable build | `Nuitka==2.4.8`, one-file Windows executable |
 | Persistent app data | One per-user JSON settings file |
@@ -89,24 +92,24 @@ and exits with status `1`. `windows-ddc` itself defines no console entry point o
 5. Choose the intended monitor and wait for the status bar to report a successful volume read.
 6. Test at a safe listening level with the buttons or slider before relying on the global volume keys.
 
-The first detected monitor is selected when no saved selection matches. Run only one copy: the application has no single-instance guard, and multiple copies can install competing global hooks and race over the same settings file.
+With no saved selection, the app selects automatically only when exactly one verifiable monitor exists. Multiple monitors require an explicit choice. A saved monitor that is missing or ambiguous is never replaced with the first enumerated monitor. Run only one copy: the application has no single-instance guard, and multiple copies can install competing global hooks and race over the same settings file.
 
 ## Operation
 
 | Action | Behavior |
 | --- | --- |
-| Start | Creates the tray and keyboard-hook threads, hides in the notification area when the tray is available, then discovers monitors in the background. |
+| Start | Creates display-change, tray, and keyboard-hook threads, hides in the notification area when the tray is available, then discovers monitors in the background. |
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
-| Select a monitor | Choose it in the read-only list. The selection is saved before its volume read completes. |
-| Change volume | Use `-`, `+`, release the slider, or press Volume Down/Up. Values are clamped to `0`–`100`; writes are followed by a readback. |
-| Refresh | Re-enumerates monitors and reads the selected monitor again. Use it after hotplug, topology, or external OSD volume changes. |
+| Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
+| Change volume | Use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
+| Refresh | Re-enumerates monitors and reads the exact saved selection again. It never falls back to a different monitor. |
 | Minimize | Sends the control window back to the notification area. |
 | Close the restored window | Exits the application; it does not merely hide the window. |
 | Exit from the tray | Removes the hook and tray icon, closes the overlay, and exits. |
 
-Monitor discovery is not periodic, and the displayed value is not polled for changes made by another program or the monitor's OSD. Refresh before acting on a value that may have changed externally.
+Monitor discovery is event-driven rather than periodic. Windows display and monitor-device notifications immediately suspend control and schedule a debounced refresh with bounded retries. The displayed volume is not polled for changes made by another program or the monitor's OSD.
 
-A DDC write and its readback are not transactional. If the write succeeds but readback fails, the monitor may already have changed. The application reports that uncertainty, replaces the displayed value with `--`, releases global volume-key interception, and requires a successful Refresh before resuming control. Volume changes are not rolled back when the application exits.
+A DDC write and its readback are not transactional. If the write succeeds but readback fails, or if the display changes during an in-flight call, the monitor may already have changed. The application reports that uncertainty in the overlay and status bar, replaces the displayed value with `--`, releases global key interception, and performs read-only rediscovery without retrying the write. Volume changes are not rolled back when the application exits.
 
 The UI range is `0`–`100`, but a monitor can report a lower device maximum and reject a higher target. That dependency error is shown in the status bar.
 
@@ -119,11 +122,14 @@ There is no separate health command, readiness endpoint, log file, or console in
 | `Searching for monitors...` | DDC/CI enumeration and the initial read are running. |
 | `Ready. N monitor(s) detected...` | A selected monitor volume was read; controls and global key interception are enabled. |
 | `No DDC/CI monitors found.` | Enumeration returned no monitor wrappers. |
+| `Display configuration changed...` | Control was disabled immediately and automatic revalidation is pending. |
+| `Selected monitor ... ambiguous/not found` | No substitute target was chosen; select the monitor again or reconnect it. |
+| `Display-change listener failed: ...` | All monitor-volume writes are disabled because reset protection is unavailable. |
 | A read/write/detection error | The underlying operation failed; the status contains the formatted exception text. |
 | `Volume-key listener failed: ...` | The global hook failed. The GUI may still control the monitor. |
 | `Tray icon failed: ...` | A native notification-area operation failed. |
 
-Volume controls remain disabled until a selected monitor has a readable volume. Global key interception additionally requires the native listener to be installed and live. A hotplug or stale-monitor write failure marks the hardware volume unknown, disables monitor controls, and returns subsequent physical Volume Down/Up presses to Windows until **Refresh** reads the selected monitor successfully. If the hook fails, the GUI can continue controlling the monitor but cannot consume global volume keys.
+Volume controls remain disabled until the display-change listener is live and the exact selected monitor has a readable volume. Global key interception additionally requires the keyboard listener to be installed and live. During an unavailable period, physical Volume Down/Up presses pass through to Windows and the app shows one error overlay per period. If the keyboard hook fails, the GUI can continue controlling the monitor; if display-change protection fails, all writes remain disabled.
 
 ## Configuration and persistent data
 
@@ -132,8 +138,10 @@ There are no application-specific environment variables, CLI flags, environment 
 | Input or field | Default | Effect |
 | --- | --- | --- |
 | `APPDATA` | If unset or empty, `Path.home()` | Base directory for the `windows-ddc` settings folder. |
-| `selected_monitor.description` | No saved value | Monitor description reported by the DDC library. |
-| `selected_monitor.ordinal` | No saved value | One-based occurrence among monitors with the same description. |
+| `schema_version` | `2` for newly written settings | Selects the stable-identity settings schema. |
+| `selected_monitor.description` | No saved value | Human-readable description; used for safe migration of unique legacy selections. |
+| `selected_monitor.identity.device_path` | No saved value | Case-insensitive Windows monitor interface path and fallback identity. |
+| Optional EDID identity fields | Omitted when unavailable | Manufacturer ID, product code, and normalized serial used as the preferred identity. |
 
 The normal settings path is:
 
@@ -151,16 +159,24 @@ The exact schema is:
 
 ```json
 {
+  "schema_version": 2,
   "selected_monitor": {
     "description": "Monitor description",
-    "ordinal": 1
+    "identity": {
+      "device_path": "Windows monitor interface path",
+      "manufacturer_id": "DEL",
+      "product_code": 4660,
+      "serial_number": "EXAMPLE-SERIAL"
+    }
   }
 }
 ```
 
-Writes go to sibling `settings.tmp` first and then replace `settings.json`. There is no schema version, migration system, file lock, or multi-process coordination. The durable identity is description plus duplicate ordinal—not EDID, serial number, or the displayed numeric index—so reordering identical monitors can change which physical device a saved key selects. If the saved key is absent, the first enumerated monitor is selected and saved.
+Writes go to sibling `settings.tmp` first and then replace `settings.json`. There is no file lock or multi-process coordination. A unique EDID manufacturer/product/serial match may follow a monitor to another port; duplicate or unavailable serials require the saved Windows device path. Device paths commonly change when a monitor moves between GPU ports, in which case manual selection is required. Some monitors provide missing, placeholder, or duplicate serial data.
 
-Missing, unreadable, syntactically invalid, or invalid nested settings are normally treated as no selection. In version `0.1.0`, valid JSON whose top-level value is not an object can raise an unhandled startup error; restore a valid object or move that file aside.
+Legacy description/ordinal files remain readable. A legacy selection is promoted to version 2 only when its description identifies exactly one verifiable current monitor; duplicate legacy descriptions fail closed and require manual selection.
+
+Missing, unreadable, syntactically invalid, non-object, unknown-version, or invalid nested settings are treated as no selection. JSON booleans are not accepted as legacy ordinals.
 
 The settings file contains monitor selection only, not volume, credentials, or secrets. The actual volume is monitor hardware state and is read again at startup.
 
@@ -229,7 +245,7 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a small standard-library unit-test suite for hotkey safety state. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing a hook, or contacting monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated settings, topology generations, and fresh-handle revalidation. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -253,7 +269,7 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 ```
 
-Changes to GUI, tray, hook, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up the live selection settings first. At minimum, verify discovery, selection persistence, volume read/write and readback, overlay timing, hook-start failure, key pass-through before readiness and after a write failure, key capture after readiness, held-key behavior across readiness loss, minimize/restore, Refresh after topology changes, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
+Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify unique/no-serial/duplicate identity behavior, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, minimize/restore, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 
@@ -265,14 +281,15 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | The process runs but no tray icon/window is reachable | Exit it with Task Manager and relaunch. Tray addition is asynchronous, so a native tray failure can occur after the main window has been hidden. |
 | `No DDC/CI monitors found.` | Enable DDC/CI in the monitor OSD, confirm the monitor exposes DDC/CI over the active connection, then choose **Refresh**. |
 | A monitor is listed but volume remains `--` | Enumeration succeeded but its volume read did not. Read the status, try another monitor, and confirm the target supports DDC/CI audio volume. |
+| `Display-change listener failed` | Monitor writes intentionally remain disabled because the app cannot provide reset protection. Restart the app; if it repeats, use Windows system volume instead. |
 | `monitorcontrol is not installed...` | From the repository root, rerun `python -m pip install -e .`. |
 | Volume keys still change Windows audio | Restore the UI and wait for a successful volume read. If `Volume-key listener failed` appeared, the buttons/slider may work but global keys will not. |
 | Volume keys stop changing Windows audio | This is expected while the app is ready. Close the restored window, or use tray **Exit** while minimized, to restore normal system-volume behavior. |
-| A volume press is consumed just after unplugging the monitor | The attempted write detects the stale target and releases interception for subsequent physical presses; release the current key. Reconnect the monitor and choose **Refresh** before monitor control resumes. |
-| The wrong physical monitor is controlled | Restore the UI and select the target again. Identical descriptions are distinguished only by current enumeration order. |
-| The displayed value is stale | Choose **Refresh** after changes made by the monitor OSD, another tool, or a topology change. There is no live polling. |
+| A volume press occurs during a display change | Notifications release interception immediately. If Windows did not notify before the first press, that press can be consumed while asynchronous validation rejects the monitor write; later presses pass through. |
+| The selected monitor is missing or ambiguous | The app will not choose another monitor. Reconnect it or explicitly select the intended target. |
+| The displayed value is stale | Choose **Refresh** after changes made by the monitor OSD or another tool. Display topology changes refresh automatically, but external volume is not polled. |
 | Selection is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Save errors are not surfaced. |
-| Startup fails after editing settings | Exit the app and move `settings.json` aside or restore a top-level JSON object matching the documented schema. |
+| Selection is lost after moving a no-serial monitor | Its Windows device path changed. Select it again so schema version 2 records the new path. |
 | Build fails before compilation | Install `.[build]`, ensure `python` resolves on `PATH`, and keep `app.py` and `windows-ddc.ico` at the repository root. |
 
 ## Further documentation
