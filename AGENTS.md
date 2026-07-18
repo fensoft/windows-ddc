@@ -9,12 +9,12 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, rotating diagnostics, display invalidation, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
+- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, autostart command/registry behavior, rotating diagnostics, display invalidation, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
 
 ## Runtime Shape
 
 1. `app.py` acquires the session-local `SingleInstanceGuard` before creating Tk. A duplicate broadcasts restore and exits before application initialization.
-2. The primary configures the rotating diagnostic log, creates the single `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters Tk's main loop while retaining the mutex handle.
+2. The primary configures the rotating diagnostic log, creates the single `tk.Tk`, constructs `gui.MonitorVolumeApp`, reads the current-user autostart state, and enters Tk's main loop while retaining the mutex handle.
 3. `display-change-listener`, `tray-icon`, and `volume-key-hook` are long-lived daemon threads with native Win32 message loops.
 4. `ddc-gui-worker` and `ddc-volume-write` are short-lived daemon workers for blocking DDC/CI work.
 5. Worker and native-thread callbacks cross into Tk through `queue.Queue`; `_poll_queues()` drains them every 50 ms.
@@ -29,6 +29,7 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | File | Responsibility |
 | --- | --- |
 | `app.py` | Supported process entrypoint, single-instance boundary, and Tk composition root. |
+| `autostart.py` | Current-user Run-key state and quoted source/packaged launch commands. |
 | `diagnostics.py` | Nonfatal per-user rotating-log configuration and component logger access. |
 | `main.py` | Unsupported launcher stub; prints migration guidance and returns `1`. |
 | `gui.py` | UI state machine, selection, readiness, queues, worker serialization, tray/window lifecycle. |
@@ -37,7 +38,7 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `overlay.py` | Topmost, auto-hiding volume `Toplevel`. |
 | `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
 | `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display notifications, tray controller, global keyboard hook, and DWM helpers. |
-| `tests/` | Hardware-free hotkey, identity, settings, single-instance, topology-generation, fresh-write, resilience, and tray-recovery regressions. |
+| `tests/` | Hardware-free hotkey, identity, settings, autostart, single-instance, topology-generation, fresh-write, resilience, and tray-recovery regressions. |
 | `.github/workflows/ci.yml` | Windows Python 3.10/3.14 hardware-free unit and low-risk validation workflow. |
 | `pyproject.toml` | Python requirement, dependency pins, and installed flat modules. |
 | `build_exe.ps1` | One-file Nuitka build for `dist\windows-ddc.exe`. |
@@ -57,6 +58,7 @@ Changes to the icon name or location must update `theme.APP_ICON_PATH`, `--windo
 - Missing, unreadable, invalid-JSON, non-object, unknown-version, and invalid nested monitor settings are treated as absent. JSON booleans are rejected as legacy ordinals. Missing or invalid Change speed defaults to `slow`; valid persisted values are `slow`, `medium`, and `fast`.
 - Do not read, overwrite, delete, or reset a user's live `settings.json` or leftover `settings.tmp` during automated work. Patch `settings.SETTINGS_PATH` to a unique temporary path before calling load/save functions.
 - Live diagnostics normally reside at `%LOCALAPPDATA%\windows-ddc\windows-ddc.log`, fall back to `APPDATA` and then home, and retain two 512 KiB backups. Do not read, overwrite, delete, or reset them during automated work; pass a unique temporary path to `configure_logging()` in tests.
+- Start with Windows is represented only by `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\windows-ddc`. Never read, create, change, or delete the live value during automated work; mock `autostart.winreg`. The GUI is the authorized interactive mutation path.
 - The physical monitor volume is external mutable state. A set can succeed even if the following readback fails, and shutdown does not restore the old value.
 - No secrets are currently used or stored. Never add tokens, credentials, private endpoints, dumps, or machine-specific values to source, screenshots, fixtures, logs, or documentation.
 
@@ -67,7 +69,7 @@ There is no database and no migration command. If the settings schema changes, i
 | Command | Use and side effects |
 | --- | --- |
 | `python -m pip install -e .` | Installs the pinned runtime dependency, can contact package indexes, modifies the active Python environment, and creates ignored egg-info. |
-| `python app.py` | The primary starts native threads, reads/writes per-user settings, installs a global hook, and contacts monitor hardware. A duplicate only broadcasts restore and exits. Run primary startup only with explicit authorization for interactive/manual testing. |
+| `python app.py` | The primary reads the current-user Run value, starts native threads, reads/writes per-user settings, installs a global hook, and contacts monitor hardware. A duplicate only broadcasts restore and exits. Run primary startup only with explicit authorization for interactive/manual testing. |
 | `python main.py` | Intentionally prints the unsupported-launcher message and exits `1`; do not treat the nonzero result as a regression. |
 | `python -m pip install -e .[build]` | Also installs pinned Nuitka tooling and may contact package indexes. |
 | `.\build_exe.ps1` | May download Nuitka support/toolchain components, writes under ignored `dist\`, may overwrite an existing artifact, and removes intermediate build output. Run only when a build is requested. |
@@ -90,6 +92,7 @@ CI is validation-only. Keep it free of `python app.py`, controller `start()` cal
 - `settings.load_selected_monitor_key()` and `settings.save_selected_monitor_key()`
 - `settings.load_change_speed()` and `settings.save_change_speed()`
 - `diagnostics.configure_logging()`, `get_logger()`, and `close_logging()`
+- `autostart.is_start_with_windows_enabled()` and `set_start_with_windows()`
 - `windows_platform.SingleInstanceGuard` and `request_existing_instance_restore()`
 - `windows_platform.DisplayChangeListener`, `TrayIconController`, and `GlobalVolumeKeyListener`
 
@@ -101,7 +104,7 @@ Run these low-risk validation checks from the repository root:
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall -q app.py ddc.py diagnostics.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
+python -m compileall -q app.py autostart.py ddc.py diagnostics.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
 python -m pip check
 git diff --check
 git diff --cached --check
@@ -121,7 +124,7 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 ```
 
-For settings changes, add isolated tests around a temporary `SETTINGS_PATH`. For pure helper changes, prefer tests that use fake monitor objects and do not import or exercise real hardware unnecessarily.
+For settings changes, add isolated tests around a temporary `SETTINGS_PATH`. For autostart changes, mock `autostart.winreg`; never use the live Run value. For pure helper changes, prefer tests that use fake monitor objects and do not import or exercise real hardware unnecessarily.
 
 GUI, tray, hook, theme, or DDC changes require an authorized Windows/manual pass with a compatible monitor. Verify:
 
@@ -131,6 +134,7 @@ GUI, tray, hook, theme, or DDC changes require an authorized Windows/manual pass
 - successful and failed volume reads;
 - slider/button/key writes and readback;
 - Slow/Medium/Fast Change speed behavior for buttons and keys, including restart persistence;
+- Start with Windows enable/disable, checkbox persistence, source command, packaged command after an authorized build, and moved-target behavior;
 - key pass-through before readiness and after exit;
 - rapid-write coalescing and `0`/`100` boundaries;
 - overlay visibility and auto-hide;
@@ -156,6 +160,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Preserve the acknowledged tray-show handshake: never withdraw Tk until the tray thread confirms `Shell_NotifyIconW` success. Tray errors must keep or restore the main window, and a `TaskbarCreated` broadcast must re-add an icon that was intended to be visible.
 - Preserve the session-local named mutex before Tk initialization and retain its handle through main-loop exit. Duplicate launch must not read settings or initialize hooks, tray state, or DDC workers; its restore broadcast is best-effort.
 - Configure logging only after acquiring the session mutex so duplicate processes never contend for rotation. Logging setup must remain nonfatal, bounded, and free of deliberate monitor identity or secret fields.
+- Preserve autostart as an explicit current-user checkbox. Keep registry failures nonfatal, quote source/executable paths, reject commands beyond 260 characters, prefer `pythonw.exe` for source, and use `sys.argv[0]` for Nuitka one-file builds so temporary extraction paths are never registered.
 - Do not bypass the guard to run multiple instances during testing. Separate sessions and external tools can still conflict over hardware or `settings.tmp` because there is no file or hardware lock.
 - Keep CI on Windows and hardware-free. Changes to its Python matrix, commands, permissions, or action versions must update `tests/test_ci_workflow.py`, README, and architecture documentation together.
 - Do not hand-edit or commit `dist/`, `windows_ddc.egg-info/`, or `__pycache__/`. The present egg-info is ignored generated residue and can be stale; `pyproject.toml` and tracked sources are authoritative.

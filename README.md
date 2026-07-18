@@ -14,7 +14,7 @@ It controls the monitor's DDC/CI audio-volume value, not the Windows audio mixer
 
 ![On-screen monitor volume overlay](docs/overlay.png)
 
-These manually maintained captures predate the wider serial-bearing monitor selector, Change speed selector, and unavailable/error overlay. Update them only from a real application capture on compatible hardware.
+These manually maintained captures predate the wider serial-bearing monitor selector, Change speed selector, Start with Windows checkbox, and unavailable/error overlay. Update them only from a real application capture on compatible hardware.
 
 ## Features
 
@@ -31,6 +31,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 - Fails closed on stalled DDC calls or internal UI callbacks, with bounded native-thread lifecycle waits.
 - Allows one instance per Windows session; launching it again restores the existing control window instead of starting competing hooks or DDC workers.
 - Keeps a small rotating per-user diagnostic log for the console-free executable.
+- Can opt the current user into launching the same source entrypoint or packaged executable at Windows sign-in.
 
 > [!IMPORTANT]
 > Once a monitor has been selected and its volume read successfully, Volume Up and Volume Down are consumed globally by this application. They no longer change Windows system volume until the application is exited or loses readiness. The mute key is not intercepted.
@@ -45,7 +46,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 | Source packaging | setuptools with flat `py-modules` |
 | Executable build | `Nuitka==2.4.8`, one-file Windows executable |
 | Continuous integration | GitHub Actions on `windows-latest`, Python 3.10 and 3.14 |
-| Persistent app data | Per-user JSON settings and rotating diagnostic logs |
+| Persistent app data | Per-user JSON settings, optional Windows Run value, and rotating diagnostic logs |
 
 The runtime is one interactive user-session process. It is not a Windows service and does not open a port, expose an HTTP API, use a database, or contact a runtime network service. See [Architecture](docs/ARCHITECTURE.md) for the process, thread, and event flows.
 
@@ -62,7 +63,7 @@ No administrator workflow is implemented or requested by the application. Run it
 
 ### Use the release executable
 
-The [0.1.0 release](https://github.com/fensoft/windows-ddc/releases/tag/0.1.0) contains the prebuilt `windows-ddc.exe` asset. Download the executable, place it in a user-controlled location, and run it. It is a standalone one-file application; there is no installer or automatic-startup registration in this repository.
+The [0.1.0 release](https://github.com/fensoft/windows-ddc/releases/tag/0.1.0) contains the prebuilt `windows-ddc.exe` asset. Download the executable, place it in a user-controlled location, and run it. It is a standalone one-file application with no installer. That tagged asset predates Start with Windows; an executable built from the current sources can register itself from the control window.
 
 The working tree's ignored `dist\` directory is not the distribution source and may be empty. The repository also does not define executable signing or publishing automation.
 
@@ -106,6 +107,7 @@ With no saved selection, the app selects automatically only when exactly one ver
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
 | Change volume | Choose a Slow (`+1`), Medium (`+2`), or Fast (`+3`) change speed, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
+| Start with Windows | Select the checkbox to write a current-user Run entry for the present source or executable path. Clear it to remove that entry. No administrator access is required. |
 | Refresh | Re-enumerates monitors and reads the exact saved selection again. It never falls back to a different monitor. |
 | Minimize | Sends the control window to the notification area only after confirmed icon addition; failure restores the normal window. |
 | Close the restored window | Exits the application; it does not merely hide the window. |
@@ -138,12 +140,13 @@ There is no separate health command, readiness endpoint, or console in the packa
 | `Internal UI callback failed: ...` | One queued UI operation failed. Queue polling continues, but monitor control remains disabled until Refresh succeeds. |
 | A read/write/detection error | The underlying operation failed; the status contains the formatted exception text. |
 | `Volume-key listener failed: ...` | The global hook failed. The GUI may still control the monitor. |
+| `Could not enable/disable Start with Windows: ...` | The current-user Run entry could not be updated; the checkbox returns to its previous state. |
 
 Volume controls remain disabled until the display-change listener is live and the exact selected monitor has a readable volume. Global key interception additionally requires the keyboard listener to be installed and live. During an unavailable period, physical Volume Down/Up presses pass through to Windows and the app shows one error overlay per period. If the keyboard hook fails, the GUI can continue controlling the monitor; if display-change protection fails, all writes remain disabled.
 
 ## Configuration and persistent data
 
-There are no application-specific environment variables, CLI flags, environment templates, or administrative settings. Standard Windows `APPDATA` and `LOCALAPPDATA` locations determine where the settings and diagnostic files are stored.
+There are no application-specific environment variables, CLI flags, environment templates, or administrative settings. Standard Windows `APPDATA` and `LOCALAPPDATA` locations determine where the settings and diagnostic files are stored. Start with Windows is a separate opt-in current-user registry value.
 
 | Input or field | Default | Effect |
 | --- | --- | --- |
@@ -154,6 +157,7 @@ There are no application-specific environment variables, CLI flags, environment 
 | `selected_monitor.description` | No saved value | Human-readable description; used for safe migration of unique legacy selections. |
 | `selected_monitor.identity.device_path` | No saved value | Case-insensitive Windows monitor interface path and fallback identity. |
 | Optional EDID identity fields | Omitted when unavailable | Manufacturer ID, product code, and normalized serial used as the preferred identity. |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\windows-ddc` | Absent | When present, launches windows-ddc for the current user at sign-in. |
 
 The normal settings path is:
 
@@ -193,6 +197,12 @@ Missing, unreadable, syntactically invalid, non-object, unknown-version, or inva
 
 The settings file contains monitor selection and change-speed preference, not volume, credentials, or secrets. The actual volume is monitor hardware state and is read again at startup.
 
+### Start with Windows
+
+The checkbox uses the standard `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` key, so it affects only the current user and needs no elevation. Windows invokes Run entries at sign-in, although it can delay their start. Clearing the checkbox deletes only the `windows-ddc` value. See [Microsoft's Run/RunOnce documentation](https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys).
+
+For the one-file build, the registered command is the original executable path; [Nuitka explicitly preserves that path in `sys.argv[0]`](https://nuitka.net/user-documentation/common-issue-solutions.html#onefile-finding-files) rather than exposing the temporary extraction path. For source execution, the command uses `pythonw.exe` when it is available beside `python.exe`, followed by the absolute `app.py` path. Paths are Windows-quoted, and commands beyond Windows' documented 260-character Run-entry limit are rejected without changing the registry. Moving or deleting a registered source tree or executable can leave a stale command; clear the checkbox before moving it, then enable it again from the new location.
+
 ### Diagnostic log
 
 The normal log path is `%LOCALAPPDATA%\windows-ddc\windows-ddc.log`. If `LOCALAPPDATA` is unavailable, it falls back to `APPDATA` and then the current user's home directory. The current file is capped at 512 KiB and keeps two rotated backups named `windows-ddc.log.1` and `windows-ddc.log.2`.
@@ -216,7 +226,7 @@ New-Item -ItemType Directory -Force -Path "$env:APPDATA\windows-ddc" | Out-Null
 Copy-Item -LiteralPath $backupPath -Destination "$env:APPDATA\windows-ddc\settings.json" -Force
 ```
 
-Choose another user-controlled backup location outside the checkout if Documents is unsuitable, and never commit the backup. If `APPDATA` is unset, substitute the fallback path documented above. Moving `settings.json` aside resets monitor selection and Change speed to its Slow default on the next launch; it does not reset monitor volume.
+Choose another user-controlled backup location outside the checkout if Documents is unsuitable, and never commit the backup. If `APPDATA` is unset, substitute the fallback path documented above. Moving `settings.json` aside resets monitor selection and Change speed to its Slow default on the next launch; it does not reset monitor volume or remove the separate Start with Windows registry value.
 
 ## Interfaces and security boundaries
 
@@ -225,7 +235,7 @@ Choose another user-controlled backup location outside the checkout if Documents
 - There are no HTTP routes, ports, realtime sockets, external runtime services, accounts, authentication, or authorization roles.
 - The process loads native Windows libraries and installs a desktop-wide low-level keyboard hook. Unrelated keys are passed onward; Volume Down and Volume Up are swallowed only when the hook is live and the application's readiness flag is active. Each physical press keeps its initial consume/pass-through decision through the matching release.
 - DDC/CI writes cross the process boundary into physical monitor hardware and may have an audible effect.
-- The application reads the current user's Windows theme preference from the registry; it does not write the registry.
+- The application reads the current user's Windows theme preference. It writes only its named current-user Run value, and only when the user toggles Start with Windows.
 - Runtime settings contain no secrets. Do not add credentials or tokens to the tracked repository or the settings schema without an explicit security design.
 
 ## Build the executable
@@ -264,11 +274,11 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, diagnostics rotation, topology generations, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, or contacts monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, autostart command/registry behavior, diagnostics rotation, topology generations, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, changes the live Run key, or contacts monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall -q app.py ddc.py diagnostics.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
+python -m compileall -q app.py autostart.py ddc.py diagnostics.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
 python -m pip check
 git diff --check
 git diff --cached --check
@@ -290,7 +300,7 @@ if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 
 CI installs only the runtime project with `python -m pip install -e .`; it does not install the optional Nuitka build extra or publish artifacts. A workflow contract test keeps the supported Python boundary, low-risk commands, and prohibited hardware/runtime commands explicit.
 
-Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
+Changes to GUI, autostart, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, Start with Windows enable/disable and restart persistence, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change the current-user Run key, physical monitor volume, and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 
@@ -315,6 +325,8 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | The displayed value is stale | Choose **Refresh** after changes made by the monitor OSD or another tool. Display topology changes refresh automatically, but external volume is not polled. |
 | Selection is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Save failures are retained in the diagnostic log. |
 | Change speed is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Invalid values safely fall back to Slow; save failures are logged. |
+| Start with Windows cannot be enabled | Read the status/log, confirm the current user can write their Run key, and check that the absolute command is no longer than 260 characters. Move the app to a shorter stable path if needed. |
+| Start with Windows points to an old location | Run the app from the old location if available and clear the checkbox, or remove the `windows-ddc` value from the current-user Run key, then enable it from the new location. |
 | Selection is lost after moving a no-serial monitor | Its Windows device path changed. Select it again so schema version 2 records the new path. |
 | Build fails before compilation | Install `.[build]`, ensure `python` resolves on `PATH`, and keep `app.py` and `windows-ddc.ico` at the repository root. |
 

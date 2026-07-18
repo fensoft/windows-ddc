@@ -8,6 +8,12 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Any, Callable, TypeAlias
 
+from autostart import (
+    AutostartCommandError,
+    AutostartUnavailableError,
+    is_start_with_windows_enabled,
+    set_start_with_windows,
+)
 from ddc import (
     MonitorRef,
     SavedMonitorSelection,
@@ -82,6 +88,14 @@ class MonitorVolumeApp:
         self.target_volume: int | None = None
         self.change_speed = load_change_speed()
         self.volume_step = self.CHANGE_SPEED_STEPS[self.change_speed]
+        try:
+            self.start_with_windows = is_start_with_windows_enabled()
+        except (OSError, AutostartUnavailableError) as exc:
+            self.start_with_windows = False
+            LOGGER.warning(
+                "Reading the Start with Windows setting failed (%s).",
+                exc.__class__.__name__,
+            )
         self.app_icon_path: Path | None = None
         self._busy = False
         self._closing = False
@@ -116,6 +130,7 @@ class MonitorVolumeApp:
         self.volume_var = tk.DoubleVar(value=0.0)
         self.volume_text_var = tk.StringVar(value="--")
         self.change_speed_var = tk.StringVar(value=self.change_speed.title())
+        self.start_with_windows_var = tk.BooleanVar(value=self.start_with_windows)
         self.status_var = tk.StringVar(value="Searching for monitors...")
 
         self.app_icon_path = apply_app_icon(self.root)
@@ -220,6 +235,20 @@ class MonitorVolumeApp:
         )
         self.increase_button.grid(row=3, column=3, sticky="e", pady=(6, 0))
 
+        self.start_with_windows_check = ttk.Checkbutton(
+            content,
+            text="Start with Windows",
+            variable=self.start_with_windows_var,
+            command=self.on_start_with_windows_toggled,
+        )
+        self.start_with_windows_check.grid(
+            row=4,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(12, 0),
+        )
+
         self.status_bar = tk.Label(
             self.root,
             textvariable=self.status_var,
@@ -305,6 +334,26 @@ class MonitorVolumeApp:
             save_change_speed(selected_speed)
         except (OSError, ValueError) as exc:
             LOGGER.warning("Saving Change speed failed (%s).", exc.__class__.__name__)
+
+    def on_start_with_windows_toggled(self) -> None:
+        enabled = bool(self.start_with_windows_var.get())
+        try:
+            set_start_with_windows(enabled)
+        except (OSError, AutostartCommandError, AutostartUnavailableError) as exc:
+            self.start_with_windows_var.set(not enabled)
+            LOGGER.warning(
+                "Updating the Start with Windows setting failed (%s).",
+                exc.__class__.__name__,
+            )
+            action = "enable" if enabled else "disable"
+            self._set_status(
+                f"Could not {action} Start with Windows: {self._format_error(exc)}"
+            )
+            return
+
+        self.start_with_windows = enabled
+        state = "enabled" if enabled else "disabled"
+        self._set_status(f"Start with Windows {state}.")
 
     def _handle_display_change_from_thread(self) -> None:
         self._invalidate_topology_generation()

@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+
+RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "windows-ddc"
+MAX_RUN_COMMAND_LENGTH = 260
+SOURCE_ENTRYPOINT = Path(__file__).resolve().with_name("app.py")
+
+
+class AutostartUnavailableError(RuntimeError):
+    pass
+
+
+class AutostartCommandError(ValueError):
+    pass
+
+
+def build_autostart_command(
+    launch_target: Path,
+    python_executable: Path | None = None,
+) -> str:
+    target = launch_target.resolve()
+    if target.suffix.casefold() == ".exe":
+        arguments = [str(target)]
+    else:
+        if python_executable is None:
+            raise AutostartCommandError(
+                "A Python executable is required for a source launch target."
+            )
+        arguments = [str(python_executable.resolve()), str(target)]
+    command = subprocess.list2cmdline(arguments)
+    if len(command) > MAX_RUN_COMMAND_LENGTH:
+        raise AutostartCommandError(
+            f"The startup command exceeds Windows' {MAX_RUN_COMMAND_LENGTH}-character limit."
+        )
+    return command
+
+
+def current_autostart_command() -> str:
+    process_target = Path(sys.argv[0]).resolve()
+    if process_target.suffix.casefold() == ".exe":
+        return build_autostart_command(process_target)
+
+    python_executable = Path(sys.executable).resolve()
+    if python_executable.name.casefold() == "python.exe":
+        pythonw_executable = python_executable.with_name("pythonw.exe")
+        if pythonw_executable.is_file():
+            python_executable = pythonw_executable
+    return build_autostart_command(SOURCE_ENTRYPOINT, python_executable)
+
+
+def _require_winreg():
+    if winreg is None:
+        raise AutostartUnavailableError("Start with Windows is unavailable on this platform.")
+    return winreg
+
+
+def is_start_with_windows_enabled() -> bool:
+    registry = _require_winreg()
+    try:
+        with registry.OpenKey(
+            registry.HKEY_CURRENT_USER,
+            RUN_KEY_PATH,
+            0,
+            registry.KEY_QUERY_VALUE,
+        ) as key:
+            registry.QueryValueEx(key, RUN_VALUE_NAME)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def set_start_with_windows(enabled: bool) -> None:
+    registry = _require_winreg()
+    if enabled:
+        with registry.CreateKeyEx(
+            registry.HKEY_CURRENT_USER,
+            RUN_KEY_PATH,
+            0,
+            registry.KEY_SET_VALUE,
+        ) as key:
+            registry.SetValueEx(
+                key,
+                RUN_VALUE_NAME,
+                0,
+                registry.REG_SZ,
+                current_autostart_command(),
+            )
+        return
+
+    try:
+        with registry.OpenKey(
+            registry.HKEY_CURRENT_USER,
+            RUN_KEY_PATH,
+            0,
+            registry.KEY_SET_VALUE,
+        ) as key:
+            try:
+                registry.DeleteValue(key, RUN_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass

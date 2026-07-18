@@ -8,7 +8,7 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 
 1. The supported entrypoint, `app.py`, acquires a session-local named mutex. A duplicate broadcasts a restore request and exits before creating Tk or application subsystems.
 2. The primary instance configures a rotating per-user diagnostic log, creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()` while retaining the mutex handle.
-3. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference and loads the saved monitor selection and Change speed preference from `settings.py`.
+3. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference, reads the optional current-user autostart value, and loads the saved monitor selection and Change speed preference from `settings.py`.
 4. It builds the fixed-size control window, status bar, and hidden `overlay.VolumeOverlay` on the Tk thread.
 5. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
 6. It independently starts the tray controller and global keyboard hook. Their failures remain nonfatal to the other subsystems.
@@ -60,13 +60,14 @@ The guard is acquired before logging or Tk and always closed in `finally`. This 
 
 ### No command or HTTP entrypoint
 
-`pyproject.toml` has no `[project.scripts]` or `[project.gui-scripts]` entry, and the code has no argument parser. There are no HTTP handlers, routes, sockets, or method/route semantics. The only user entry is process launch. Principal runtime inputs include GUI/native events, DDC results, Windows theme and system metrics, settings-path/environment resolution, settings contents, and tracked icon-file availability.
+`pyproject.toml` has no `[project.scripts]` or `[project.gui-scripts]` entry, and the code has no argument parser. There are no HTTP handlers, routes, sockets, or method/route semantics. The only user entry is process launch. Principal runtime inputs include GUI/native events, DDC results, Windows theme and system metrics, the current-user Run value, settings-path/environment resolution, settings contents, and tracked icon-file availability.
 
 ## Module responsibilities
 
 | Module | Responsibility |
 | --- | --- |
 | `app.py` | Enforces the single-instance boundary, then creates and runs the application. |
+| `autostart.py` | Quotes source/packaged launch commands and reads/writes the named current-user Run value. |
 | `diagnostics.py` | Configures and closes the bounded per-user rotating log and provides component loggers. |
 | `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, persistence calls, tray lifecycle, and shutdown. |
 | `ddc.py` | Defines `MonitorRef`, selection identity, monitor discovery, clamping, and DDC read/change/write wrappers. |
@@ -219,13 +220,13 @@ Widget state derives from `_busy`, monitor availability, confirmed volume, displ
 HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme
 ```
 
-Only a DWORD value of `0` selects dark mode. The preference is sampled once at startup. Dark mode creates a custom ttk theme and tries DWM attributes `20` then `19`; light mode prefers `vista`, `xpnative`, then `winnative` when available. The registry is read-only.
+Only a DWORD value of `0` selects dark mode. The preference is sampled once at startup. Dark mode creates a custom ttk theme and tries DWM attributes `20` then `19`; light mode prefers `vista`, `xpnative`, then `winnative` when available. This theme lookup is read-only.
 
-The manually maintained screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). They predate the wider identity selector, Change speed selector, and error presentation; there is no automated screenshot workflow, so updates require real scrubbed captures.
+The manually maintained screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). They predate the wider identity selector, Change speed selector, Start with Windows checkbox, and error presentation; there is no automated screenshot workflow, so updates require real scrubbed captures.
 
-## Persistent data and filesystem ownership
+## Persistent data, registry, and filesystem ownership
 
-The intended durable application files are the settings file and bounded diagnostic logs. The normal settings path is:
+The intended durable state is the settings file, bounded diagnostic logs, and an optional named current-user Run value. The normal settings path is:
 
 ```text
 %APPDATA%\windows-ddc\settings.json
@@ -263,11 +264,13 @@ The monitor's actual volume is external mutable hardware state, not app storage.
 
 `diagnostics.LOG_PATH` normally resolves to `%LOCALAPPDATA%\windows-ddc\windows-ddc.log`, falling back to `APPDATA` and then the home directory. `RotatingFileHandler` caps the current log at 512 KiB and retains two backups. Handler creation failure installs a managed `NullHandler`, so an unwritable diagnostic location never blocks application startup. Routine GUI messages log operation classes rather than monitor descriptions, identities, or device paths; unexpected top-level tracebacks can still contain local source paths.
 
+`autostart.py` treats `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\windows-ddc` as the Start with Windows source of truth. Reading occurs during Tk construction; writes and deletion occur only from the checkbox callback. A packaged launch quotes the absolute original one-file path from `sys.argv[0]`; a source launch quotes a sibling `pythonw.exe` when available plus the repository `app.py`. The helper rejects commands longer than the Windows Run-key limit of 260 characters. Registry errors restore the prior checkbox value, update status, and emit a privacy-safe diagnostic. Moving the registered target can leave a stale value until the user disables or replaces it.
+
 ### Backup and restore format
 
 Backup is a plain copy of `settings.json` while all instances are stopped. Restore is replacement with a UTF-8 JSON object matching the schema above. Moving the file aside resets saved selection and Change speed. There is no archive, database dump, encryption, integrity marker, or built-in backup command.
 
-Tests must replace `settings.SETTINGS_PATH` and diagnostic destinations with unique temporary paths. They must not read, redirect, mutate, or delete a user's live app-data files.
+Tests must replace `settings.SETTINGS_PATH` and diagnostic destinations with unique temporary paths and mock `autostart.winreg`. They must not read, redirect, mutate, or delete a user's live app-data files or Run value.
 
 ## Authentication and security boundaries
 
@@ -280,6 +283,7 @@ The security-relevant boundaries are local:
 3. **Native ABI.** Incorrect ctypes structures, argument types, callback signatures, or callback lifetimes can corrupt or crash the process.
 4. **Cross-thread UI.** Tk is not thread-safe; queues are the required ownership boundary.
 5. **Per-user files.** Settings and diagnostics are user-writable and unencrypted. Settings contain monitor identity metadata; routine diagnostics avoid it, although unexpected tracebacks can contain local paths. A device-interface path is machine-specific but is not a credential.
+6. **Current-user autostart.** The opt-in Run value stores an absolute local command and executes it at sign-in. It requires no administrator access, but moving the target can leave stale machine-specific path data.
 
 Runtime code has no network path. Dependency installation and Nuitka's `--assume-yes-for-downloads` build can contact external package/toolchain servers; these are development/build effects, not application runtime behavior.
 
@@ -288,7 +292,7 @@ Runtime code has no network path. Dependency installation and Nuitka's `--assume
 `pyproject.toml` uses `setuptools.build_meta` as its PEP 517 backend, with unpinned `setuptools` and `wheel` build-system requirements. It declares project version `0.1.0`, Python `>=3.10`, and explicit flat modules:
 
 ```text
-app, diagnostics, gui, ddc, settings, theme, overlay, windows_platform
+app, autostart, diagnostics, gui, ddc, settings, theme, overlay, windows_platform
 ```
 
 The direct runtime dependency is pinned to `monitorcontrol==4.2.0`. The `build` extra pins `Nuitka==2.4.8`. There is no lockfile; build-system requirements and transitive build dependencies are not fully pinned.
@@ -308,7 +312,7 @@ The direct runtime dependency is pinned to `monitorcontrol==4.2.0`. The `build` 
 
 The runtime data copy of the icon is essential because `theme.APP_ICON_PATH` resolves a file beside `theme.py`; an embedded PE icon alone does not satisfy that lookup.
 
-The output is ignored `dist\windows-ddc.exe`. Nuitka support/toolchain downloads are accepted automatically, an existing named artifact may be overwritten, and `--remove-output` removes the intermediate build directory after output is produced. The repository defines no installer, Windows service, autostart entry, signing step, CI artifact build, publishing script, or deployment environment.
+The output is ignored `dist\windows-ddc.exe`. Nuitka support/toolchain downloads are accepted automatically, an existing named artifact may be overwritten, and `--remove-output` removes the intermediate build directory after output is produced. The application can create its current-user autostart value interactively, but the repository defines no installer, Windows service, machine-wide startup registration, signing step, CI artifact build, publishing script, or deployment environment.
 
 The setuptools configuration defines no package-data rule for `windows-ddc.ico`; generated `SOURCES.txt` also omits it. An ordinary wheel/non-editable source install therefore falls back to default icons at runtime. Editable source execution sees the repository file, while the Nuitka build explicitly includes it.
 
@@ -327,9 +331,9 @@ The status bar is the immediate health surface:
 - startup begins at `Searching for monitors...`;
 - successful initial read reports Ready, monitor count, and selected description;
 - empty discovery reports `No DDC/CI monitors found.`;
-- monitor, hook, and tray exceptions are formatted into status text.
+- monitor, hook, tray, and autostart-update exceptions are formatted into status text.
 
-The packaged executable disables its console. `diagnostics.py` retains lifecycle, thread/component, native-subsystem, settings-save, DDC watchdog, refresh/write, queued-callback, shutdown, and top-level failure records in a bounded per-user log. Tray failures still restore the main window so an immediate status remains visible.
+The packaged executable disables its console. `diagnostics.py` retains lifecycle, thread/component, native-subsystem, settings-save, autostart-update, DDC watchdog, refresh/write, queued-callback, shutdown, and top-level failure records in a bounded per-user log. Tray failures still restore the main window so an immediate status remains visible.
 
 Volume-control readiness requires a live display listener, valid topology generation, unique selected identity, and confirmed volume. Key-consumption readiness additionally requires an active keyboard hook. Refresh clears readiness while it runs and restores it only after an exact match and successful read. Topology and write failures trigger bounded automatic rediscovery; external OSD/tool volume changes are not reconciled automatically.
 
@@ -344,13 +348,13 @@ Known failure-state caveats include:
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, diagnostic writing/rotation/setup failure, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, source/packaged autostart command quoting and mocked registry behavior, diagnostic writing/rotation/setup failure, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
 
 `.github/workflows/ci.yml` runs on `windows-latest` for pushes, pull requests, and manual dispatches with a Python 3.10/3.14 matrix. It installs the runtime project, runs the unit suite, compiles runtime modules, checks installed dependencies, parses `build_exe.ps1` without executing it, checks tracked/staged whitespace, and requires a clean repository state. It neither starts `app.py` nor invokes hardware tools, monitor enumeration, the Nuitka build, publishing, or deployment. `tests/test_ci_workflow.py` locks down that hardware-free contract.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 
-An authorized manual Windows/hardware pass is required for changes to discovery, selection, DDC I/O, key interception, Change speed, tray lifecycle, theme/chrome, overlay, or shutdown. Tests of settings code must patch `SETTINGS_PATH` to a temporary location. Pure DDC wrapper tests should use fake context-manager monitor objects.
+An authorized manual Windows/hardware pass is required for changes to discovery, selection, DDC I/O, key interception, Change speed, autostart, tray lifecycle, theme/chrome, overlay, or shutdown. Tests of settings code must patch `SETTINGS_PATH` to a temporary location; autostart tests must mock the registry. Pure DDC wrapper tests should use fake context-manager monitor objects.
 
 ## Things to preserve
 
@@ -363,8 +367,9 @@ An authorized manual Windows/hardware pass is required for changes to discovery,
 - Keep native ctypes callbacks strongly referenced and stop display/hook/tray loops before destroying Tk.
 - Do not use the displayed index or description ordinal as current persistent identity. Preserve version-2 matching and backward-compatible legacy loading.
 - Never touch live per-user settings or diagnostics in automated work; use temporary paths.
+- Never touch the live Run value in automated work. Preserve current-user-only opt-in writes, Windows quoting, the command-length check, source `pythonw.exe` preference, and original one-file executable path.
 - Treat physical monitor volume and global keyboard handling as safety-sensitive side effects.
 - Keep `[tool.setuptools].py-modules` synchronized when distributable runtime modules are added, renamed, or removed.
 - Keep `windows-ddc.ico`, `theme.APP_ICON_PATH`, and both Nuitka icon flags synchronized.
 - Do not treat generated egg-info, `dist\`, or `__pycache__\` as authoritative source.
-- Do not document APIs, services, authentication, databases, health probes, hotplug polling, automatic startup, signing, or deployment automation unless they are actually implemented.
+- Do not document APIs, services, authentication, databases, health probes, hotplug polling, machine-wide startup, signing, or deployment automation unless they are actually implemented.

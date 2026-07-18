@@ -73,6 +73,17 @@ def ensure_dark_theme(style: ttk.Style) -> None:
             },
             "TFrame": {"configure": {"background": DARK_BG}},
             "TLabel": {"configure": {"background": DARK_BG, "foreground": DARK_TEXT}},
+            "TCheckbutton": {
+                "configure": {
+                    "background": DARK_BG,
+                    "foreground": DARK_TEXT,
+                    "focuscolor": DARK_ACCENT,
+                },
+                "map": {
+                    "background": [("active", DARK_BG), ("disabled", DARK_BG)],
+                    "foreground": [("disabled", DARK_DISABLED_TEXT)],
+                },
+            },
             "TButton": {
                 "configure": {
                     "background": DARK_SURFACE,
