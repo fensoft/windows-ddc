@@ -9,7 +9,7 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is no automated test, lint, format, type-check, or CI configuration. State that limitation accurately.
+- There is a small standard-library unit-test suite for fail-safe hotkey behavior. There is no lint, format, type-check, third-party test-framework, or CI configuration. State that limitation accurately.
 
 ## Runtime Shape
 
@@ -36,6 +36,7 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `overlay.py` | Topmost, auto-hiding volume `Toplevel`. |
 | `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
 | `windows_platform.py` | Win32 ctypes ABI, tray controller, global keyboard hook, and DWM helpers. |
+| `tests/test_hotkey_safety.py` | Hardware-free readiness, write-failure, listener-liveness, shutdown, and paired key-event regressions. |
 | `pyproject.toml` | Python requirement, dependency pins, and installed flat modules. |
 | `build_exe.ps1` | One-file Nuitka build for `dist\windows-ddc.exe`. |
 | `windows-ddc.ico` | Tracked executable, window, and tray icon source. |
@@ -91,6 +92,7 @@ Keep each per-monitor DDC get/set sequence inside `with monitor_ref.monitor:`. E
 Run these low-risk validation checks from the repository root:
 
 ```powershell
+python -m unittest discover -s tests -v
 python -m compileall -q app.py ddc.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
 python -m pip check
 git diff --check
@@ -132,7 +134,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Do not perform blocking DDC work on the Tk thread.
 - Do not mutate Tk state directly from another thread. Keep callbacks small and exception-safe so `_poll_queues()` continues rescheduling itself.
 - Preserve `_volume_write_inflight` / `_pending_target_volume` serialization. Do not introduce concurrent operations against the selected monitor wrapper.
-- Do not broaden key consumption beyond `_hotkeys_enabled`. A successful selected-volume read or write readback can set `_hotkeys_ready`; Refresh start, selection clearing, listener error, and shutdown clear it, while a write failure currently does not. Any readiness change must test hook-start failures, reads, writes, Refresh, disconnect, and shutdown, and should leave system keys safer on failure.
+- Do not broaden key consumption beyond `_hotkeys_enabled`. A successful selected-volume read or write readback can set `_hotkeys_ready`; Refresh start, selection clearing, listener error, write failure, and shutdown clear it. `_hotkeys_enabled` and the callback-time check must also require a live native listener. Preserve the per-press consume/pass-through decision through matching key-up. Any readiness change must test hook-start failures, reads, writes, Refresh, disconnect, shutdown, and held keys across readiness transitions, and should leave system keys safer on failure.
 - Keep ctypes callback objects (`_wndproc` and `_hook_callback`) strongly referenced for their controllers' lifetimes. Incorrect ctypes signatures or callback lifetimes can crash the process.
 - Stop hook and tray message loops before destroying Tk. Their current joins have two-second timeouts; DDC workers are daemon threads and are not joined.
 - Do not assume a DDC error means no hardware change occurred. Set plus readback is not transactional.

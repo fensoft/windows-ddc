@@ -9,10 +9,13 @@ That audited history contains one parentless commit. The audit clone had no loca
 ### Added
 
 - Added release-history, architecture, and repository-agent documentation.
+- Added hardware-free unit coverage for hook liveness, readiness loss, write failures, shutdown, and paired volume-key events.
 
 ### Changed
 
 - Expanded user and operator documentation without changing runtime behavior.
+- Made global Volume Down/Up interception require a live native hook and release subsequent presses after an uncertain DDC write result until Refresh succeeds.
+- Kept the consume/pass-through decision stable from the first key-down through the matching key-up.
 
 ## [0.1.0] - 2026-03-22
 

@@ -216,7 +216,12 @@ class MonitorVolumeApp:
             self._hotkey_delta_queue.put(delta)
 
     def _should_consume_volume_keys(self) -> bool:
-        return self._hotkeys_enabled and not self._closing
+        return (
+            self._hotkeys_enabled
+            and not self._closing
+            and self._listener is not None
+            and self._listener.is_active
+        )
 
     def _post_to_ui(self, callback: Callable[[], None]) -> None:
         if not self._closing:
@@ -289,6 +294,8 @@ class MonitorVolumeApp:
         self._hotkeys_enabled = (
             self._hotkeys_ready
             and not self._closing
+            and self._listener is not None
+            and self._listener.is_active
             and self.selected_key is not None
             and self.current_volume is not None
         )
@@ -459,9 +466,17 @@ class MonitorVolumeApp:
         self._volume_write_inflight = False
         self._pending_target_volume = None
         self._busy = False
-        self.target_volume = self.current_volume
-        self._set_displayed_volume(self.current_volume)
-        self._set_status(self._format_error(exc))
+        self.current_volume = None
+        self.target_volume = None
+        self._hotkeys_ready = False
+        self._update_hotkey_state()
+        self._set_displayed_volume(None)
+        if self._overlay is not None:
+            self._overlay.hide()
+        error_message = self._format_error(exc).rstrip(".")
+        self._set_status(
+            f"{error_message}. Monitor volume may have changed. Refresh to resume volume-key control."
+        )
         self._apply_control_state()
 
     def refresh_monitors(self) -> None:
@@ -503,9 +518,14 @@ class MonitorVolumeApp:
                 self._set_displayed_volume(volume)
                 self._hotkeys_ready = True
                 self._update_hotkey_state()
-                self._set_status(
-                    f"Ready. {len(monitors)} monitor(s) detected. Volume keys control {selected_monitor.description}."
-                )
+                if self._hotkeys_enabled:
+                    self._set_status(
+                        f"Ready. {len(monitors)} monitor(s) detected. Volume keys control {selected_monitor.description}."
+                    )
+                else:
+                    self._set_status(
+                        f"Ready. {len(monitors)} monitor(s) detected. Global volume-key control is unavailable."
+                    )
             else:
                 self.current_volume = None
                 self._set_displayed_volume(None)
@@ -543,7 +563,14 @@ class MonitorVolumeApp:
             self._set_displayed_volume(volume)
             self._hotkeys_ready = True
             self._update_hotkey_state()
-            self._set_status(f"{monitor_ref.description} selected. Volume keys now control this monitor at {volume}%.")
+            if self._hotkeys_enabled:
+                self._set_status(
+                    f"{monitor_ref.description} selected. Volume keys now control this monitor at {volume}%."
+                )
+            else:
+                self._set_status(
+                    f"{monitor_ref.description} selected at {volume}%. Global volume-key control is unavailable."
+                )
 
         def on_error(exc: Exception) -> None:
             self.current_volume = None

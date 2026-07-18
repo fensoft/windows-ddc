@@ -135,7 +135,7 @@ A request follows this sequence:
 5. `set_monitor_volume()` performs the hardware set and readback inside one context.
 6. Success updates `current_volume`. If the latest pending target differs and the same selection remains active, the next worker starts without clearing the operation slot.
 7. When no distinct follow-up is needed, confirmed state is displayed, the overlay is shown again with the readback (resetting its 1.4-second timer), and controls return to the normal ready state. An equal pending value can remain stored until `_start_volume_write()` clears it at the beginning of the next write, but it is not acted on.
-8. Failure clears the pending target and busy/write flags, restores the last confirmed main-window value, and reports the exception. It does not replace or hide the optimistic overlay value, which remains until its existing auto-hide timer fires.
+8. Failure clears the pending target and busy/write flags, marks confirmed and target volume unknown, displays `--`, hides the optimistic overlay, clears hotkey readiness, and reports that Refresh is required. The native hook immediately passes subsequent physical volume-key presses back to Windows.
 
 This last-target-wins design limits DDC traffic during key repeat while keeping the UI responsive. Replacing it with a worker per key event would introduce concurrent hardware access and stale completion ordering.
 
@@ -148,7 +148,7 @@ The callback passes unrelated keys directly to `CallNextHookEx`. It recognizes o
 - `VK_VOLUME_DOWN` (`0xAE`)
 - `VK_VOLUME_UP` (`0xAF`)
 
-When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys are also passed onward. When true, key-down enqueues a `-1` or `+1` delta and both key-down and key-up messages return `1`, preventing Windows system audio from handling them. The mute key is not recognized.
+When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys are also passed onward. On the first key-down of a physical press, the hook records whether that press should be consumed. Repeated key-down and the matching key-up retain that decision even if readiness changes mid-press. A consumed repeat enqueues a `-1` or `+1` delta only while readiness remains active; after readiness loss it remains consumed without producing more DDC requests until release. The mute key is not recognized.
 
 The callback does not inspect the `KBDLLHOOKSTRUCT.flags` injection bits. Synthesized Volume Down/Up events are therefore handled like physical-key events.
 
@@ -157,13 +157,14 @@ The callback does not inspect the `KBDLLHOOKSTRUCT.flags` injection bits. Synthe
 ```text
 `_hotkeys_ready` is true
 AND app not closing
+AND the listener exists and its native hook is active
 AND selected key exists
 AND confirmed current volume exists
 ```
 
-`_hotkeys_ready` is application/DDC state set after successful selected-volume reads or write readbacks; it is not proof that the native listener exists or remains live.
+`_hotkeys_ready` is application/DDC state set after successful selected-volume reads or write readbacks. Native hook liveness is tracked independently by `GlobalVolumeKeyListener.is_active`; `_should_consume_volume_keys()` rechecks both the computed state and live listener state at callback time.
 
-There is no user preference to disable the hook while leaving the app running. A later write failure does not clear `current_volume` or `_hotkeys_ready`, so a disconnected/stale target can leave the volume keys consumed until Refresh or exit. Conversely, a hook-start/runtime failure can be obscured by any later successful selected-volume read or write readback: those paths can set `_hotkeys_ready` again, `_hotkeys_enabled` does not explicitly require `_listener` to exist or be live, and later status text can replace the listener error. These are current-state limitations, not intended guarantees.
+There is no user preference to disable the hook while leaving the app running. A write failure clears `current_volume`, `target_volume`, and `_hotkeys_ready`, so a disconnected or stale target releases subsequent physical key presses until a successful Refresh. A hook-start or runtime failure also prevents `_hotkeys_enabled` from becoming true even if later DDC reads succeed. If readiness is lost during an already-consumed press, that press remains consumed through key-up to avoid splitting one physical press between the monitor and Windows.
 
 ## Tray and window event flow
 
@@ -303,12 +304,12 @@ The status bar is the only normal health surface:
 
 The packaged executable disables its console, and no file logger exists. If the main window is withdrawn, a tray failure can also hide the only error surface.
 
-Volume-control readiness requires monitors plus a confirmed volume. Successful startup normally installs the listener before the first selected-volume read, but the computed key-consumption state does not require `_listener` to exist or be live. A refresh clears `_hotkeys_ready` while it runs and restores it after a successful read. There is no automatic retry after topology changes and no live reconciliation with volume changes from the monitor OSD or another tool.
+Volume-control readiness requires monitors plus a confirmed volume. Key-consumption readiness additionally requires an active native listener. A refresh clears `_hotkeys_ready` while it runs and restores it after a successful read. A write failure marks the volume unknown and also requires Refresh before monitor control resumes. There is no automatic retry after topology changes and no live reconciliation with volume changes from the monitor OSD or another tool.
 
 Known failure-state caveats include:
 
-- a stale/hotplug write error can leave keys consumed until Refresh or exit;
-- hook initialization failure can be overwritten visually by later Ready state;
+- a stale/hotplug target is detected only when the user invokes Refresh or an attempted DDC operation fails;
+- the physical key press that discovers a stale target remains consumed through its release, while subsequent presses pass through;
 - tray/icon loss can strand a withdrawn main window;
 - `start()` waits on native readiness events without a timeout;
 - a set may succeed before its readback fails;
@@ -316,7 +317,7 @@ Known failure-state caveats include:
 
 ## Development and testing
 
-The repository contains no tests, test framework configuration, linter, formatter, type checker, or CI workflow. Low-risk validation consists of Python compilation, an installed-dependency check, PowerShell parsing, tracked/staged diff whitespace checks, and explicit status review; exact commands are in `README.md` and `AGENTS.md`.
+The repository contains a small standard-library unit-test suite for fail-safe hotkey state and key-event pairing. It has no third-party test framework configuration, linter, formatter, type checker, or CI workflow. Low-risk validation consists of that suite, Python compilation, an installed-dependency check, PowerShell parsing, tracked/staged diff whitespace checks, and explicit status review; exact commands are in `README.md` and `AGENTS.md`.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 

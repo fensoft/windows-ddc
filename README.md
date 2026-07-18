@@ -19,7 +19,7 @@ It controls the monitor's DDC/CI audio-volume value, not the Windows audio mixer
 - Discovers DDC/CI monitors and lets the user select one target.
 - Reads and writes the selected monitor's volume in the `0`–`100` range.
 - Provides a slider and `-`/`+` buttons with one-point steps.
-- Intercepts the global Windows Volume Down and Volume Up keys while a target is ready.
+- Intercepts the global Windows Volume Down and Volume Up keys only while the native hook is live and a target is ready.
 - Shows a bottom-centered overlay with best-effort topmost placement and a 1.4-second timer after the most recent overlay update.
 - Starts in the Windows notification area, with Restore and Exit actions.
 - Remembers the selected monitor across launches.
@@ -106,7 +106,7 @@ The first detected monitor is selected when no saved selection matches. Run only
 
 Monitor discovery is not periodic, and the displayed value is not polled for changes made by another program or the monitor's OSD. Refresh before acting on a value that may have changed externally.
 
-A DDC write and its readback are not transactional. If the write succeeds but readback fails, the monitor may already have changed even though the application reports an error and restores its cached display value. Volume changes are not rolled back when the application exits.
+A DDC write and its readback are not transactional. If the write succeeds but readback fails, the monitor may already have changed. The application reports that uncertainty, replaces the displayed value with `--`, releases global volume-key interception, and requires a successful Refresh before resuming control. Volume changes are not rolled back when the application exits.
 
 The UI range is `0`–`100`, but a monitor can report a lower device maximum and reject a higher target. That dependency error is shown in the status bar.
 
@@ -123,7 +123,7 @@ There is no separate health command, readiness endpoint, log file, or console in
 | `Volume-key listener failed: ...` | The global hook failed. The GUI may still control the monitor. |
 | `Tray icon failed: ...` | A native notification-area operation failed. |
 
-Volume controls and key interception remain disabled until a selected monitor has a readable volume during normal startup. Refresh remains available whenever no operation is busy. A later hotplug or stale-monitor write failure does not currently clear that readiness state; use **Refresh** or exit the application if the hardware volume keys keep being consumed after a failure.
+Volume controls remain disabled until a selected monitor has a readable volume. Global key interception additionally requires the native listener to be installed and live. A hotplug or stale-monitor write failure marks the hardware volume unknown, disables monitor controls, and returns subsequent physical Volume Down/Up presses to Windows until **Refresh** reads the selected monitor successfully. If the hook fails, the GUI can continue controlling the monitor but cannot consume global volume keys.
 
 ## Configuration and persistent data
 
@@ -188,7 +188,7 @@ Choose another user-controlled backup location outside the checkout if Documents
 - `windows-ddc` has no supported application CLI, subcommands, or flags beyond launching `app.py` or the executable.
 - Installing the dependency also installs the upstream `monitorcontrol` console command. It is not a `windows-ddc` interface and can directly change monitor volume, brightness, power, mute, or input; do not use it unless that hardware operation is intentional.
 - There are no HTTP routes, ports, realtime sockets, external runtime services, accounts, authentication, or authorization roles.
-- The process loads native Windows libraries and installs a desktop-wide low-level keyboard hook. Unrelated keys are passed onward; Volume Down and Volume Up are swallowed only when the application's readiness flag is active.
+- The process loads native Windows libraries and installs a desktop-wide low-level keyboard hook. Unrelated keys are passed onward; Volume Down and Volume Up are swallowed only when the hook is live and the application's readiness flag is active. Each physical press keeps its initial consume/pass-through decision through the matching release.
 - DDC/CI writes cross the process boundary into physical monitor hardware and may have an audible effect.
 - The application reads the current user's Windows theme preference from the registry; it does not write the registry.
 - Runtime settings contain no secrets. Do not add credentials or tokens to the tracked repository or the settings schema without an explicit security design.
@@ -229,9 +229,10 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has no automated test suite, lint/type/format configuration, or CI workflow. The following safe checks cover syntax and repository formatting without launching the UI, installing a hook, or contacting monitor hardware:
+The repository has a small standard-library unit-test suite for hotkey safety state. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing a hook, or contacting monitor hardware:
 
 ```powershell
+python -m unittest discover -s tests -v
 python -m compileall -q app.py ddc.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
 python -m pip check
 git diff --check
@@ -252,7 +253,7 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 ```
 
-Changes to GUI, tray, hook, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up the live selection settings first. At minimum, verify discovery, selection persistence, volume read/write and readback, overlay timing, key pass-through before readiness, key capture after readiness, minimize/restore, Refresh after topology changes, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
+Changes to GUI, tray, hook, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up the live selection settings first. At minimum, verify discovery, selection persistence, volume read/write and readback, overlay timing, hook-start failure, key pass-through before readiness and after a write failure, key capture after readiness, held-key behavior across readiness loss, minimize/restore, Refresh after topology changes, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 
@@ -267,7 +268,7 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | `monitorcontrol is not installed...` | From the repository root, rerun `python -m pip install -e .`. |
 | Volume keys still change Windows audio | Restore the UI and wait for a successful volume read. If `Volume-key listener failed` appeared, the buttons/slider may work but global keys will not. |
 | Volume keys stop changing Windows audio | This is expected while the app is ready. Close the restored window, or use tray **Exit** while minimized, to restore normal system-volume behavior. |
-| Keys are consumed after unplugging the monitor | Choose **Refresh** or exit. Current readiness is not cleared by every later write failure. |
+| A volume press is consumed just after unplugging the monitor | The attempted write detects the stale target and releases interception for subsequent physical presses; release the current key. Reconnect the monitor and choose **Refresh** before monitor control resumes. |
 | The wrong physical monitor is controlled | Restore the UI and select the target again. Identical descriptions are distinguished only by current enumeration order. |
 | The displayed value is stale | Choose **Refresh** after changes made by the monitor OSD, another tool, or a topology change. There is no live polling. |
 | Selection is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Save errors are not surfaced. |

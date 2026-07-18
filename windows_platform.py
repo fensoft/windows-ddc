@@ -518,12 +518,18 @@ class GlobalVolumeKeyListener:
         self.on_error = on_error
         self.step = step
         self._hook_ready = threading.Event()
+        self._hook_active = threading.Event()
         self._stop_event = threading.Event()
         self._hook_thread_id = 0
         self._hook_handle: wintypes.HANDLE | None = None
         self._start_error: Exception | None = None
         self._thread = threading.Thread(target=self._hook_loop, name="volume-key-hook", daemon=True)
         self._hook_callback = HOOKPROC(self._keyboard_proc)
+        self._volume_key_consumption: dict[int, bool] = {}
+
+    @property
+    def is_active(self) -> bool:
+        return self._hook_active.is_set()
 
     def start(self) -> None:
         self._thread.start()
@@ -535,6 +541,7 @@ class GlobalVolumeKeyListener:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._hook_active.clear()
         if self._hook_thread_id:
             user32.PostThreadMessageW(self._hook_thread_id, WM_QUIT, 0, 0)
         if self._thread.is_alive():
@@ -550,6 +557,7 @@ class GlobalVolumeKeyListener:
             return
 
         self._hook_handle = hook_handle
+        self._hook_active.set()
         self._hook_ready.set()
 
         message = wintypes.MSG()
@@ -563,12 +571,32 @@ class GlobalVolumeKeyListener:
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
         except Exception as exc:
+            self._hook_active.clear()
             if not self._stop_event.is_set():
                 self.on_error(exc)
         finally:
+            self._hook_active.clear()
+            self._volume_key_consumption.clear()
             if self._hook_handle:
                 user32.UnhookWindowsHookEx(self._hook_handle)
                 self._hook_handle = None
+
+    def _resolve_volume_key_event(self, vk_code: int, message: int) -> tuple[bool, int | None]:
+        if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            if vk_code not in self._volume_key_consumption:
+                self._volume_key_consumption[vk_code] = self.should_consume()
+
+            consume = self._volume_key_consumption[vk_code]
+            if not consume or not self.should_consume():
+                return consume, None
+
+            delta = self.step if vk_code == VK_VOLUME_UP else -self.step
+            return True, delta
+
+        if message in (WM_KEYUP, WM_SYSKEYUP):
+            return self._volume_key_consumption.pop(vk_code, False), None
+
+        return False, None
 
     def _keyboard_proc(self, n_code: int, w_param: int, l_param: int) -> int:
         if n_code != HC_ACTION:
@@ -578,12 +606,11 @@ class GlobalVolumeKeyListener:
         if key_info.vkCode not in (VK_VOLUME_DOWN, VK_VOLUME_UP):
             return user32.CallNextHookEx(self._hook_handle, n_code, w_param, l_param)
 
-        consume = self.should_consume()
-        if consume and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            delta = self.step if key_info.vkCode == VK_VOLUME_UP else -self.step
+        consume, delta = self._resolve_volume_key_event(key_info.vkCode, w_param)
+        if delta is not None:
             self.on_delta(delta)
 
-        if consume and w_param in (WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP):
+        if consume:
             return 1
 
         return user32.CallNextHookEx(self._hook_handle, n_code, w_param, l_param)
