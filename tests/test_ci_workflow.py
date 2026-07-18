@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+
+WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+
+
+class CIWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    def test_workflow_covers_supported_python_boundary_on_windows(self) -> None:
+        self.assertIn("runs-on: windows-latest", self.workflow)
+        self.assertIn('python-version: ["3.10", "3.14"]', self.workflow)
+        self.assertIn("uses: actions/checkout@v6", self.workflow)
+        self.assertIn("uses: actions/setup-python@v6", self.workflow)
+        self.assertIn("permissions:\n  contents: read", self.workflow)
+
+    def test_workflow_runs_every_low_risk_repository_check(self) -> None:
+        expected_commands = (
+            "python -m pip install -e .",
+            "python -m unittest discover -s tests -v",
+            "python -m compileall -q",
+            "python -m pip check",
+            "Language.Parser]::ParseFile",
+            "git diff --check",
+            "git diff --cached --check",
+            "git status --short",
+        )
+        for command in expected_commands:
+            with self.subTest(command=command):
+                self.assertIn(command, self.workflow)
+
+    def test_workflow_never_launches_the_app_or_hardware_tools(self) -> None:
+        forbidden_commands = (
+            "python app.py",
+            "monitorcontrol",
+            "run: .\\build_exe.ps1",
+            "enumerate_monitors(",
+            "set_monitor_volume(",
+        )
+        for command in forbidden_commands:
+            with self.subTest(command=command):
+                self.assertNotIn(command, self.workflow)
+
+
+if __name__ == "__main__":
+    unittest.main()

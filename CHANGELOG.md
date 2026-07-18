@@ -15,6 +15,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Added hardware-free tray acknowledgement, fallback, timeout, and Explorer-restart recovery coverage.
 - Added hardware-free coverage for queued-callback containment, DDC watchdog behavior, bounded native-thread lifecycle waits, and shutdown diagnostics.
 - Added a session-scoped Windows single-instance guard with hardware-free mutex, composition-root, and duplicate-restore coverage.
+- Added Windows GitHub Actions CI across Python 3.10 and 3.14 for the hardware-free unit suite and all low-risk repository checks.
 
 ### Changed
 

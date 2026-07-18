@@ -43,6 +43,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 | Windows integration | `ctypes` calls to User32, Kernel32, Shell32, Dxva2, SetupAPI, Advapi32, and optional DWM APIs |
 | Source packaging | setuptools with flat `py-modules` |
 | Executable build | `Nuitka==2.4.8`, one-file Windows executable |
+| Continuous integration | GitHub Actions on `windows-latest`, Python 3.10 and 3.14 |
 | Persistent app data | One per-user JSON settings file |
 
 The runtime is one interactive user-session process. It is not a Windows service and does not open a port, expose an HTTP API, use a database, or contact a runtime network service. See [Architecture](docs/ARCHITECTURE.md) for the process, thread, and event flows.
@@ -245,7 +246,7 @@ The script resolves the `python` command, changes to the repository root, verifi
 python -m nuitka --onefile --windows-console-mode=disable --enable-plugins=tk-inter --windows-icon-from-ico=windows-ddc.ico --include-data-files=windows-ddc.ico=windows-ddc.ico --output-dir=dist --output-filename=windows-ddc.exe --remove-output --assume-yes-for-downloads app.py
 ```
 
-The icon is both the executable icon and runtime data because `theme.py` loads a sibling `windows-ddc.ico`. The build can download Nuitka support/toolchain components, writes the named artifact under `dist\`, may overwrite an existing artifact, and removes its intermediate build directory. `dist\` is ignored. No installer, signing step, CI build, or release-publishing workflow is defined.
+The icon is both the executable icon and runtime data because `theme.py` loads a sibling `windows-ddc.ico`. The build can download Nuitka support/toolchain components, writes the named artifact under `dist\`, may overwrite an existing artifact, and removes its intermediate build directory. `dist\` is ignored. CI validates source without executing this build; no installer, signing step, CI artifact build, or release-publishing workflow is defined.
 
 ## Development and testing
 
@@ -255,7 +256,7 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, topology generations, fresh-handle revalidation, single-instance behavior, resilience, and tray recovery. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, topology generations, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, or contacts monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -278,6 +279,8 @@ $parseErrors = $null
 ) | Out-Null
 if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 ```
+
+CI installs only the runtime project with `python -m pip install -e .`; it does not install the optional Nuitka build extra or publish artifacts. A workflow contract test keeps the supported Python boundary, low-risk commands, and prohibited hardware/runtime commands explicit.
 
 Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
 

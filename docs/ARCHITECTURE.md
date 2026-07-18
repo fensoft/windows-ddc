@@ -305,7 +305,7 @@ The direct runtime dependency is pinned to `monitorcontrol==4.2.0`. The `build` 
 
 The runtime data copy of the icon is essential because `theme.APP_ICON_PATH` resolves a file beside `theme.py`; an embedded PE icon alone does not satisfy that lookup.
 
-The output is ignored `dist\windows-ddc.exe`. Nuitka support/toolchain downloads are accepted automatically, an existing named artifact may be overwritten, and `--remove-output` removes the intermediate build directory after output is produced. The repository defines no installer, Windows service, autostart entry, signing step, CI workflow, publishing script, or deployment environment.
+The output is ignored `dist\windows-ddc.exe`. Nuitka support/toolchain downloads are accepted automatically, an existing named artifact may be overwritten, and `--remove-output` removes the intermediate build directory after output is produced. The repository defines no installer, Windows service, autostart entry, signing step, CI artifact build, publishing script, or deployment environment.
 
 The setuptools configuration defines no package-data rule for `windows-ddc.ico`; generated `SOURCES.txt` also omits it. An ordinary wheel/non-editable source install therefore falls back to default icons at runtime. Editable source execution sees the repository file, while the Nuitka build explicitly includes it.
 
@@ -341,7 +341,9 @@ Known failure-state caveats include:
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, and shutdown diagnostics. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
+
+`.github/workflows/ci.yml` runs on `windows-latest` for pushes, pull requests, and manual dispatches with a Python 3.10/3.14 matrix. It installs the runtime project, runs the unit suite, compiles runtime modules, checks installed dependencies, parses `build_exe.ps1` without executing it, checks tracked/staged whitespace, and requires a clean repository state. It neither starts `app.py` nor invokes hardware tools, monitor enumeration, the Nuitka build, publishing, or deployment. `tests/test_ci_workflow.py` locks down that hardware-free contract.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 

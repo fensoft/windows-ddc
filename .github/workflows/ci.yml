@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hardware-free-validation:
+    name: Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install runtime dependency
+        run: python -m pip install -e .
+
+      - name: Run hardware-free unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile runtime modules
+        run: >-
+          python -m compileall -q
+          app.py ddc.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
+
+      - name: Check installed dependencies
+        run: python -m pip check
+
+      - name: Parse build script without executing it
+        shell: powershell
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path .\build_exe.ps1),
+              [ref]$tokens,
+              [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -ne 0) {
+              $parseErrors
+              exit 1
+          }
+
+      - name: Check tracked diff whitespace
+        run: |
+          git diff --check
+          git diff --cached --check
+
+      - name: Confirm clean repository state
+        shell: powershell
+        run: |
+          $status = git status --short
+          if ($status) {
+              $status
+              exit 1
+          }

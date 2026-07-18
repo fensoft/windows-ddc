@@ -9,7 +9,7 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, display invalidation, fresh-handle revalidation, single-instance behavior, resilience, and tray recovery. There is no lint, format, type-check, third-party test-framework, or CI configuration. State that limitation accurately.
+- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, display invalidation, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
 
 ## Runtime Shape
 
@@ -37,6 +37,7 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
 | `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display notifications, tray controller, global keyboard hook, and DWM helpers. |
 | `tests/` | Hardware-free hotkey, identity, settings, single-instance, topology-generation, fresh-write, resilience, and tray-recovery regressions. |
+| `.github/workflows/ci.yml` | Windows Python 3.10/3.14 hardware-free unit and low-risk validation workflow. |
 | `pyproject.toml` | Python requirement, dependency pins, and installed flat modules. |
 | `build_exe.ps1` | One-file Nuitka build for `dist\windows-ddc.exe`. |
 | `windows-ddc.ico` | Tracked executable, window, and tray icon source. |
@@ -72,6 +73,8 @@ There is no database and no migration command. If the settings schema changes, i
 Do not call `enumerate_monitors()`, `read_monitor_volume()`, `set_monitor_volume()`, `change_monitor_volume()`, the packaged executable, `monitorcontrol`, `python -m monitorcontrol`, or `start()` on the display/global-hook/tray controllers as generic smoke tests. They cross hardware or user-session boundaries; the upstream dependency CLI can mutate multiple monitor settings.
 
 There is no deploy, publish, tag, installer, or signing command in this repository. Do not push, tag, upload a release, publish a package, or invent a release workflow without explicit user authorization.
+
+CI is validation-only. Keep it free of `python app.py`, controller `start()` calls, monitor enumeration/I/O, `build_exe.ps1` execution, artifacts, signing, publishing, and deployment.
 
 ## API Shape
 
@@ -150,6 +153,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Preserve the acknowledged tray-show handshake: never withdraw Tk until the tray thread confirms `Shell_NotifyIconW` success. Tray errors must keep or restore the main window, and a `TaskbarCreated` broadcast must re-add an icon that was intended to be visible.
 - Preserve the session-local named mutex before Tk initialization and retain its handle through main-loop exit. Duplicate launch must not read settings or initialize hooks, tray state, or DDC workers; its restore broadcast is best-effort.
 - Do not bypass the guard to run multiple instances during testing. Separate sessions and external tools can still conflict over hardware or `settings.tmp` because there is no file or hardware lock.
+- Keep CI on Windows and hardware-free. Changes to its Python matrix, commands, permissions, or action versions must update `tests/test_ci_workflow.py`, README, and architecture documentation together.
 - Do not hand-edit or commit `dist/`, `windows_ddc.egg-info/`, or `__pycache__/`. The present egg-info is ignored generated residue and can be stale; `pyproject.toml` and tracked sources are authoritative.
 - Review `docs/app.png` and `docs/overlay.png` when visible UI changes. Update them only with real application captures and scrub machine-specific or sensitive content.
 - Keep `README.md`, `CHANGELOG.md`, this file, and `docs/ARCHITECTURE.md` consistent when commands, dependencies, entrypoints, paths, settings, release behavior, or architectural boundaries change.
