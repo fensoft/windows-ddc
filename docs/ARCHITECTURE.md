@@ -6,23 +6,24 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 
 ## High-level flow
 
-1. The supported entrypoint, `app.py`, creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()`.
-2. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference and loads the saved monitor selection and Change speed preference from `settings.py`.
-3. It builds the fixed-size control window, status bar, and hidden `overlay.VolumeOverlay` on the Tk thread.
-4. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
-5. It independently starts the tray controller and global keyboard hook. Their failures remain nonfatal to the other subsystems.
-6. It schedules the recurring Tk queue poll and a one-shot initial monitor refresh after 50 ms.
-7. The refresh worker enumerates DDC wrappers and Windows monitor identities, exact-matches the saved target, and reads its volume. With no saved selection, automatic selection occurs only when exactly one verifiable monitor exists.
-8. The worker enqueues a tokened completion callback. The Tk queue poll applies the monitor list, selection, displayed volume, readiness, and status text.
-9. A volume request updates the UI optimistically, then a serialized worker reacquires all wrappers and exact-matches the identity before set/readback.
-10. The readback becomes authoritative. A coalesced follow-up starts another worker and therefore performs another fresh discovery/match.
-11. Display/device notifications invalidate a thread-safe topology generation immediately, release key consumption, clear pending writes, and schedule debounced discovery with bounded retries.
-12. A 10-second watchdog fails a stalled DDC operation closed without releasing its serialization slot; when the worker eventually returns, its result is ignored and read-only rediscovery follows.
-13. Shutdown disables key consumption, cancels Tk timers, stops display/hook/tray loops, reports missed stop deadlines, closes the overlay, and destroys Tk.
+1. The supported entrypoint, `app.py`, acquires a session-local named mutex. A duplicate broadcasts a restore request and exits before creating Tk or application subsystems.
+2. The primary instance creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()` while retaining the mutex handle.
+3. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference and loads the saved monitor selection and Change speed preference from `settings.py`.
+4. It builds the fixed-size control window, status bar, and hidden `overlay.VolumeOverlay` on the Tk thread.
+5. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
+6. It independently starts the tray controller and global keyboard hook. Their failures remain nonfatal to the other subsystems.
+7. It schedules the recurring Tk queue poll and a one-shot initial monitor refresh after 50 ms.
+8. The refresh worker enumerates DDC wrappers and Windows monitor identities, exact-matches the saved target, and reads its volume. With no saved selection, automatic selection occurs only when exactly one verifiable monitor exists.
+9. The worker enqueues a tokened completion callback. The Tk queue poll applies the monitor list, selection, displayed volume, readiness, and status text.
+10. A volume request updates the UI optimistically, then a serialized worker reacquires all wrappers and exact-matches the identity before set/readback.
+11. The readback becomes authoritative. A coalesced follow-up starts another worker and therefore performs another fresh discovery/match.
+12. Display/device notifications invalidate a thread-safe topology generation immediately, release key consumption, clear pending writes, and schedule debounced discovery with bounded retries.
+13. A 10-second watchdog fails a stalled DDC operation closed without releasing its serialization slot; when the worker eventually returns, its result is ignored and read-only rediscovery follows.
+14. Shutdown disables key consumption, cancels Tk timers, stops display/hook/tray loops, reports missed stop deadlines, closes the overlay, destroys Tk, and releases the mutex handle.
 
 ## Runtime process and thread ownership
 
-Source execution uses one interactive process. The one-file Nuitka executable adds a compiler-controlled bootstrap/extraction phase, but the repository does not customize that phase.
+Source execution uses one interactive process per Windows session, enforced by `SingleInstanceGuard` and the named `Local\windows-ddc-single-instance` mutex. The one-file Nuitka executable adds a compiler-controlled bootstrap/extraction phase, but the repository does not customize that phase.
 
 | Thread | Lifetime | Owns or performs | Communication boundary |
 | --- | --- | --- | --- |
@@ -48,10 +49,10 @@ All Tk calls must remain on the Tk thread. A native or DDC thread must enqueue w
 `app.main()` is intentionally small:
 
 ```text
-tk.Tk -> MonitorVolumeApp -> Tk mainloop
+SingleInstanceGuard -> tk.Tk -> MonitorVolumeApp -> Tk mainloop -> release guard
 ```
 
-Keeping composition here makes `gui.py` responsible for application behavior without creating a second root or hidden launcher layer. Both source execution and `build_exe.ps1` use `app.py`.
+The guard is acquired before Tk and always closed in `finally`. `ERROR_ALREADY_EXISTS` makes a duplicate register and broadcast the restore message, then return `0` without reading settings or creating hooks, tray state, or DDC workers. Keeping composition here makes `gui.py` responsible for application behavior without creating a second root or hidden launcher layer. Both source execution and `build_exe.ps1` use `app.py` and therefore share the same mutex.
 
 ### Unsupported entrypoint: `main.py`
 
@@ -65,13 +66,13 @@ Keeping composition here makes `gui.py` responsible for application behavior wit
 
 | Module | Responsibility |
 | --- | --- |
-| `app.py` | Creates and runs the application. |
+| `app.py` | Enforces the single-instance boundary, then creates and runs the application. |
 | `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, persistence calls, tray lifecycle, and shutdown. |
 | `ddc.py` | Defines `MonitorRef`, selection identity, monitor discovery, clamping, and DDC read/change/write wrappers. |
 | `settings.py` | Atomically loads and replaces the selected-monitor and Change speed JSON settings. |
 | `overlay.py` | Implements topmost transient volume and unavailable/error presentations. |
 | `theme.py` | Samples the Windows theme, defines ttk dark styling, applies DWM dark chrome, and resolves the icon. |
-| `windows_platform.py` | Declares the Win32 ctypes ABI and implements monitor identity/EDID inventory, display notifications, tray, keyboard-hook, and DWM helpers. |
+| `windows_platform.py` | Declares the Win32 ctypes ABI and implements the single-instance mutex/restore signal, monitor identity/EDID inventory, display notifications, tray, keyboard-hook, and DWM helpers. |
 | `main.py` | Rejects the old launch path. |
 
 `ddc.change_monitor_volume()` is an internal helper but is not used by the GUI. The GUI uses its own cached-target and serialized-write flow so rapid key events can be coalesced.
@@ -193,7 +194,7 @@ The controller tries to load `windows-ddc.ico` at the Windows small-icon dimensi
 
 The tray's native window is created synchronously from the caller's perspective because `start()` waits up to two seconds for `_ready`. `show()` creates a per-request completion event, posts `WM_TRAY_SHOW`, and waits up to two seconds for the tray thread's actual `Shell_NotifyIconW` result. `MonitorVolumeApp.minimize_to_tray()` withdraws Tk only after that acknowledgement. A native failure, stopped controller, post failure, or timeout keeps/restores and normalizes the main window, hides any late icon best-effort, and reports the error in the visible status bar.
 
-The controller registers the shell's `TaskbarCreated` message during construction. When Explorer recreates the taskbar, a previously visible icon is re-added with `NIM_ADD` and its notification version is restored. If re-registration fails, the error crosses the queue boundary and Tk restores the main window instead of leaving the process unreachable.
+The controller registers the shell's `TaskbarCreated` message and the app's stable duplicate-launch restore message during construction. A restore broadcast invokes the normal tray-to-Tk restore callback. When Explorer recreates the taskbar, a previously visible icon is re-added with `NIM_ADD` and its notification version is restored. If re-registration fails, the error crosses the queue boundary and Tk restores the main window instead of leaving the process unreachable.
 
 Minimizing a visible Tk window schedules an idle check and withdraws it only if the state is `iconic`. Restoring hides the tray icon, normalizes/lifts/focuses the Tk window, and reapplies dark title-bar chrome. Closing the visible window follows the full shutdown path rather than minimizing.
 
@@ -253,7 +254,7 @@ It inherits the current user's filesystem permissions. The schema is:
 }
 ```
 
-`save_selected_monitor_key()` requires a stable identity and preserves a valid Change speed. `save_change_speed()` normalizes its value and preserves current schema-v2 or legacy monitor-selection data. Both create the parent directories, write indented UTF-8 JSON to sibling `settings.tmp`, and replace `settings.json`. This reduces exposure to a partial destination but does not coordinate multiple processes; instances share both paths. Persistence failure is not visible in the status bar.
+`save_selected_monitor_key()` requires a stable identity and preserves a valid Change speed. `save_change_speed()` normalizes its value and preserves current schema-v2 or legacy monitor-selection data. Both create the parent directories, write indented UTF-8 JSON to sibling `settings.tmp`, and replace `settings.json`. This reduces exposure to a partial destination but provides no file lock. The session mutex prevents ordinary project instances in one Windows session from racing, but separate sessions and external tools are not coordinated. Persistence failure is not visible in the status bar.
 
 The monitor-selection writer emits schema version 2. Its loader accepts the old unversioned description/ordinal shape for safe one-time promotion, rejects boolean ordinals, and treats missing files, I/O failures, invalid JSON, non-object roots, unknown versions, and invalid nested data as no selection. Change speed is an independent top-level preference: missing or invalid values default to `slow`, and valid values are `slow`, `medium`, and `fast`.
 
@@ -335,11 +336,12 @@ Known failure-state caveats include:
 - a DDC call that never returns keeps monitor control disabled until the application is restarted; the worker stays daemonized and no concurrent replacement call is started;
 - if Windows emits no notification before a first post-change press, that press can be consumed while asynchronous revalidation rejects the write; subsequent presses pass through;
 - a set may succeed before its readback fails;
+- duplicate restoration is a best-effort broadcast and can be missed during the primary instance's very early startup or shutdown;
 - the packaged executable has no console or file logger, so shutdown diagnostics are primarily useful in source runs and may be visible only briefly in the status bar.
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, topology generations, display-message routing, fresh-wrapper writes, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, and shutdown diagnostics. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, and shutdown diagnostics. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 
@@ -348,6 +350,7 @@ An authorized manual Windows/hardware pass is required for changes to discovery,
 ## Things to preserve
 
 - Keep `app.py` as the single supported composition root and `main.py` as an explicit unsupported stub unless compatibility policy changes.
+- Acquire and retain `SingleInstanceGuard` before creating Tk; duplicate launches must remain side-effect-free apart from the best-effort restore broadcast.
 - Keep all Tk access on the main thread; use `_result_queue`, `_hotkey_delta_queue`, and `_post_to_ui()` at cross-thread boundaries.
 - Keep DDC work off Tk and serialize/coalesce writes. Do not start one hardware worker per key event.
 - Keep monitorcontrol operations inside the monitor context manager and clamp all public volume results/targets to `0`–`100`.

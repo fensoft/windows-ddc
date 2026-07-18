@@ -8,14 +8,31 @@ from windows_platform import PlatformError, TrayIconController, WM_TRAY_SHOW
 
 
 class TrayIconControllerTests(unittest.TestCase):
-    def make_controller(self, on_error=None) -> TrayIconController:
-        with patch("windows_platform.user32.RegisterWindowMessageW", return_value=0xC123):
+    def make_controller(self, on_error=None, on_restore=None) -> TrayIconController:
+        with patch(
+            "windows_platform.user32.RegisterWindowMessageW",
+            side_effect=[0xC123, 0xC124],
+        ):
             return TrayIconController(
                 tooltip="windows-ddc",
-                on_restore=lambda: None,
+                on_restore=on_restore or (lambda: None),
                 on_exit=lambda: None,
                 on_error=on_error or (lambda _error: None),
             )
+
+    def test_duplicate_launch_message_requests_restore(self) -> None:
+        on_restore = Mock()
+        controller = self.make_controller(on_restore=on_restore)
+
+        result = controller._window_proc(
+            123,
+            controller._restore_existing_instance_message,
+            0,
+            0,
+        )
+
+        self.assertEqual(result, 0)
+        on_restore.assert_called_once_with()
 
     def test_show_waits_for_successful_native_add(self) -> None:
         controller = self.make_controller()

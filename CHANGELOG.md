@@ -14,6 +14,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Added a persistent **Change speed** selector with Slow (`+1`), Medium (`+2`), and Fast (`+3`) choices for the GUI buttons and global volume keys.
 - Added hardware-free tray acknowledgement, fallback, timeout, and Explorer-restart recovery coverage.
 - Added hardware-free coverage for queued-callback containment, DDC watchdog behavior, bounded native-thread lifecycle waits, and shutdown diagnostics.
+- Added a session-scoped Windows single-instance guard with hardware-free mutex, composition-root, and duplicate-restore coverage.
 
 ### Changed
 
@@ -25,6 +26,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Wait for confirmed tray-icon addition before withdrawing Tk, restore the main window on tray failures, and re-add visible icons after Explorer recreates the taskbar.
 - Bound native listener startup and shutdown waits, keep Tk queue polling alive after individual callback failures, and report native threads that miss the shutdown deadline.
 - Disable monitor control after a 10-second DDC watchdog timeout, retain the single-worker serialization slot until the native call returns, ignore its late result, and then perform read-only rediscovery.
+- Reject duplicate launches before Tk or native initialization and ask the existing tray instance to restore its control window.
 
 ## [0.1.0] - 2026-03-22
 

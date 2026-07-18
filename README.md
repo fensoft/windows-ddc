@@ -29,6 +29,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 - Follows the current user's Windows light/dark application preference at startup.
 - Keeps DDC/CI work off Tk's UI thread and coalesces rapid volume changes.
 - Fails closed on stalled DDC calls or internal UI callbacks, with bounded native-thread lifecycle waits.
+- Allows one instance per Windows session; launching it again restores the existing control window instead of starting competing hooks or DDC workers.
 
 > [!IMPORTANT]
 > Once a monitor has been selected and its volume read successfully, Volume Up and Volume Down are consumed globally by this application. They no longer change Windows system volume until the application is exited or loses readiness. The mute key is not intercepted.
@@ -93,13 +94,13 @@ and exits with status `1`. `windows-ddc` itself defines no console entry point o
 5. Choose the intended monitor and wait for the status bar to report a successful volume read.
 6. Test at a safe listening level with the buttons or slider before relying on the global volume keys.
 
-With no saved selection, the app selects automatically only when exactly one verifiable monitor exists. Multiple monitors require an explicit choice. A saved monitor that is missing or ambiguous is never replaced with the first enumerated monitor. Run only one copy: the application has no single-instance guard, and multiple copies can install competing global hooks and race over the same settings file.
+With no saved selection, the app selects automatically only when exactly one verifiable monitor exists. Multiple monitors require an explicit choice. A saved monitor that is missing or ambiguous is never replaced with the first enumerated monitor. The application enforces one instance per Windows session; a duplicate launch exits before Tk, settings, hooks, tray state, or DDC work and requests that the existing instance restore its window.
 
 ## Operation
 
 | Action | Behavior |
 | --- | --- |
-| Start | Creates display-change, tray, and keyboard-hook threads with two-second startup deadlines, waits up to two seconds for confirmed tray-icon addition before hiding, then discovers monitors in the background. |
+| Start | Acquires the session-local single-instance guard, creates display-change, tray, and keyboard-hook threads with two-second startup deadlines, waits up to two seconds for confirmed tray-icon addition before hiding, then discovers monitors in the background. A duplicate launch restores the existing window and exits. |
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
 | Change volume | Choose a Slow (`+1`), Medium (`+2`), or Fast (`+3`) change speed, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
@@ -181,7 +182,7 @@ The exact schema is:
 }
 ```
 
-Writes go to sibling `settings.tmp` first and then replace `settings.json`. There is no file lock or multi-process coordination. A unique EDID manufacturer/product/serial match may follow a monitor to another port; duplicate or unavailable serials require the saved Windows device path. Device paths commonly change when a monitor moves between GPU ports, in which case manual selection is required. Some monitors provide missing, placeholder, or duplicate serial data.
+Writes go to sibling `settings.tmp` first and then replace `settings.json`. There is no file lock; the session-local process mutex prevents normal project instances in the same Windows session from racing, but does not coordinate external tools or separate Windows sessions. A unique EDID manufacturer/product/serial match may follow a monitor to another port; duplicate or unavailable serials require the saved Windows device path. Device paths commonly change when a monitor moves between GPU ports, in which case manual selection is required. Some monitors provide missing, placeholder, or duplicate serial data.
 
 Legacy description/ordinal files remain readable. A legacy selection is promoted to version 2 only when its description identifies exactly one verifiable current monitor; duplicate legacy descriptions fail closed and require manual selection.
 
@@ -254,7 +255,7 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, topology generations, fresh-handle revalidation, resilience, and tray recovery. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, topology generations, fresh-handle revalidation, single-instance behavior, resilience, and tray recovery. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -278,7 +279,7 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 ```
 
-Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
+Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 
@@ -287,6 +288,7 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | Symptom | What to check |
 | --- | --- |
 | No window appears | Check the notification area and its overflow menu, then double-click the icon or choose **Restore**. Tray-first startup is expected. |
+| Launching a second copy does nothing | The second process exits intentionally after asking the existing tray instance to restore. Check the existing window and notification area; restoration is best-effort during very early startup or shutdown. |
 | The tray icon cannot be added or disappears | The main window remains visible or is restored automatically. After Explorer restarts, the app re-adds an icon that was visible; if recovery fails, read the restored window's status bar. |
 | `No DDC/CI monitors found.` | Enable DDC/CI in the monitor OSD, confirm the monitor exposes DDC/CI over the active connection, then choose **Refresh**. |
 | A monitor is listed but volume remains `--` | Enumeration succeeded but its volume read did not. Read the status, try another monitor, and confirm the target supports DDC/CI audio volume. |

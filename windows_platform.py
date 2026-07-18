@@ -32,6 +32,7 @@ WM_TRAY_SHOW = WM_APP + 2
 WM_TRAY_HIDE = WM_APP + 3
 WM_TRAY_EXIT = WM_APP + 4
 WM_DISPLAY_LISTENER_EXIT = WM_APP + 5
+HWND_BROADCAST = 0xFFFF
 VK_VOLUME_DOWN = 0xAE
 VK_VOLUME_UP = 0xAF
 IDI_APPLICATION = 32512
@@ -64,8 +65,11 @@ DICS_FLAG_GLOBAL = 0x00000001
 DIREG_DEV = 0x00000001
 KEY_READ = 0x00020019
 REG_BINARY = 3
+ERROR_ALREADY_EXISTS = 183
 NATIVE_START_TIMEOUT_SECONDS = 2.0
 NATIVE_STOP_TIMEOUT_SECONDS = 2.0
+SINGLE_INSTANCE_MUTEX_NAME = r"Local\windows-ddc-single-instance"
+SINGLE_INSTANCE_RESTORE_MESSAGE_NAME = "windows-ddc-restore-existing-instance"
 
 BYTE = ctypes.c_ubyte
 UINT_PTR = ctypes.c_size_t
@@ -206,6 +210,10 @@ class PlatformError(RuntimeError):
     pass
 
 
+class InstanceAlreadyRunningError(PlatformError):
+    pass
+
+
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -331,6 +339,10 @@ kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+kernel32.CreateMutexW.argtypes = [LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [
@@ -392,6 +404,43 @@ def win_error(message: str) -> OSError:
 
 def make_int_resource(value: int) -> wintypes.LPCWSTR:
     return ctypes.cast(ctypes.c_void_p(value), wintypes.LPCWSTR)
+
+
+class SingleInstanceGuard:
+    def __init__(self, mutex_name: str = SINGLE_INSTANCE_MUTEX_NAME) -> None:
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+        if not handle:
+            error = win_error("CreateMutexW failed")
+            raise PlatformError(f"Failed to create the single-instance guard: {error}") from error
+
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            raise InstanceAlreadyRunningError(
+                "windows-ddc is already running in this Windows session."
+            )
+        self._handle: wintypes.HANDLE | None = handle
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is not None:
+            kernel32.CloseHandle(handle)
+
+    def __enter__(self) -> SingleInstanceGuard:
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+
+def request_existing_instance_restore() -> None:
+    message = user32.RegisterWindowMessageW(SINGLE_INSTANCE_RESTORE_MESSAGE_NAME)
+    if not message:
+        raise PlatformError("Failed to register the existing-instance restore message.")
+    if not user32.PostMessageW(HWND_BROADCAST, message, 0, 0):
+        error = win_error("Failed to broadcast the existing-instance restore message")
+        raise PlatformError(f"Failed to restore the existing windows-ddc instance: {error}") from error
 
 
 def _normalize_edid_serial(value: str) -> str | None:
@@ -837,6 +886,11 @@ class TrayIconController:
         self._taskbar_created_message = user32.RegisterWindowMessageW("TaskbarCreated")
         if not self._taskbar_created_message:
             raise PlatformError("Failed to register the TaskbarCreated message.")
+        self._restore_existing_instance_message = user32.RegisterWindowMessageW(
+            SINGLE_INSTANCE_RESTORE_MESSAGE_NAME
+        )
+        if not self._restore_existing_instance_message:
+            raise PlatformError("Failed to register the existing-instance restore message.")
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
         self._thread = threading.Thread(target=self._message_loop, name="tray-icon", daemon=True)
@@ -975,6 +1029,9 @@ class TrayIconController:
         self._release_icon_handle()
 
     def _window_proc(self, hwnd: wintypes.HWND, msg: int, w_param: int, l_param: int) -> int:
+        if msg == self._restore_existing_instance_message:
+            self.on_restore()
+            return 0
         if msg == self._taskbar_created_message:
             should_restore_icon = self._icon_visible
             self._icon_visible = False
