@@ -90,6 +90,19 @@ class MonitorVolumeAppHotkeyTests(unittest.TestCase):
         listener.is_active = False
         self.assertFalse(app._should_consume_volume_keys())
 
+    def test_step_selector_updates_the_app_and_live_listener(self) -> None:
+        app = MonitorVolumeApp.__new__(MonitorVolumeApp)
+        app.volume_step = 1
+        app.volume_step_var = Mock()
+        app.volume_step_var.get.return_value = "+3"
+        app._listener = Mock()
+
+        app.on_volume_step_selected()
+
+        self.assertEqual(app.volume_step, 3)
+        app.volume_step_var.set.assert_called_once_with("+3")
+        app._listener.set_step.assert_called_once_with(3)
+
     def test_write_failure_marks_volume_unknown_and_releases_hotkeys(self) -> None:
         app = self.make_ready_app(ListenerState(is_active=True))
         app._hotkeys_enabled = True
@@ -185,6 +198,14 @@ class GlobalVolumeKeyListenerTests(unittest.TestCase):
         self.assertEqual(listener._resolve_volume_key_event(VK_VOLUME_DOWN, WM_KEYDOWN), (True, None))
         self.assertEqual(listener._resolve_volume_key_event(VK_VOLUME_DOWN, WM_KEYUP), (True, None))
         self.assertEqual(listener._resolve_volume_key_event(VK_VOLUME_DOWN, WM_KEYDOWN), (False, None))
+
+    def test_step_can_change_without_restarting_the_hook(self) -> None:
+        listener = self.make_listener({"value": True})
+
+        self.assertEqual(listener._resolve_volume_key_event(VK_VOLUME_UP, WM_KEYDOWN), (True, 2))
+        self.assertEqual(listener._resolve_volume_key_event(VK_VOLUME_UP, WM_KEYUP), (True, None))
+        listener.set_step(3)
+        self.assertEqual(listener._resolve_volume_key_event(VK_VOLUME_DOWN, WM_KEYDOWN), (True, -3))
 
 
 if __name__ == "__main__":

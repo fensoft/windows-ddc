@@ -14,13 +14,13 @@ It controls the monitor's DDC/CI audio-volume value, not the Windows audio mixer
 
 ![On-screen monitor volume overlay](docs/overlay.png)
 
-These manually maintained captures predate the wider serial-bearing selector and the new unavailable/error overlay. Update them only from a real application capture on compatible hardware.
+These manually maintained captures predate the wider serial-bearing monitor selector, volume-step selector, and unavailable/error overlay. Update them only from a real application capture on compatible hardware.
 
 ## Features
 
 - Discovers DDC/CI monitors and lets the user select one target.
 - Reads and writes the selected monitor's volume in the `0`–`100` range.
-- Provides a slider and `-`/`+` buttons with one-point steps.
+- Provides a slider and `-`/`+` buttons with selectable `+1`, `+2`, or `+3` steps.
 - Intercepts the global Windows Volume Down and Volume Up keys only while the native hook is live and a target is ready.
 - Shows volume and fail-closed monitor errors in a bottom-centered, best-effort topmost overlay.
 - Starts in the Windows notification area, with Restore and Exit actions.
@@ -101,13 +101,15 @@ With no saved selection, the app selects automatically only when exactly one ver
 | Start | Creates display-change, tray, and keyboard-hook threads, hides in the notification area when the tray is available, then discovers monitors in the background. |
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
-| Change volume | Use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
+| Change volume | Choose a `+1`, `+2`, or `+3` step, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
 | Refresh | Re-enumerates monitors and reads the exact saved selection again. It never falls back to a different monitor. |
 | Minimize | Sends the control window back to the notification area. |
 | Close the restored window | Exits the application; it does not merely hide the window. |
 | Exit from the tray | Removes the hook and tray icon, closes the overlay, and exits. |
 
 Monitor discovery is event-driven rather than periodic. Windows display and monitor-device notifications immediately suspend control and schedule a debounced refresh with bounded retries. The displayed volume is not polled for changes made by another program or the monitor's OSD.
+
+The volume step defaults to `+1` on every launch. The selected step applies to both the on-screen `-`/`+` buttons and the global Volume Down/Up keys; it is not saved in `settings.json`.
 
 A DDC write and its readback are not transactional. If the write succeeds but readback fails, or if the display changes during an in-flight call, the monitor may already have changed. The application reports that uncertainty in the overlay and status bar, replaces the displayed value with `--`, releases global key interception, and performs read-only rediscovery without retrying the write. Volume changes are not rolled back when the application exits.
 

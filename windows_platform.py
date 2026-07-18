@@ -1034,7 +1034,9 @@ class GlobalVolumeKeyListener:
         self.on_delta = on_delta
         self.should_consume = should_consume
         self.on_error = on_error
-        self.step = step
+        self._step_lock = threading.Lock()
+        self._step = 1
+        self.set_step(step)
         self.on_unavailable = on_unavailable
         self.should_report_unavailable = should_report_unavailable or (lambda: False)
         self._hook_ready = threading.Event()
@@ -1051,6 +1053,16 @@ class GlobalVolumeKeyListener:
     @property
     def is_active(self) -> bool:
         return self._hook_active.is_set()
+
+    def set_step(self, step: int) -> None:
+        if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+            raise ValueError("Volume step must be a positive integer.")
+        with self._step_lock:
+            self._step = step
+
+    def _current_step(self) -> int:
+        with self._step_lock:
+            return self._step
 
     def start(self) -> None:
         self._thread.start()
@@ -1114,7 +1126,8 @@ class GlobalVolumeKeyListener:
             if not consume or not self.should_consume():
                 return consume, None
 
-            delta = self.step if vk_code == VK_VOLUME_UP else -self.step
+            step = self._current_step()
+            delta = step if vk_code == VK_VOLUME_UP else -step
             return True, delta
 
         if message in (WM_KEYUP, WM_SYSKEYUP):

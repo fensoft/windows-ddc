@@ -106,6 +106,30 @@ class RevalidationTests(unittest.TestCase):
         self.assertIsInstance(error, DisplayTopologyChanged)
         self.assertEqual(generation, 4)
 
+    def test_coalesced_write_keeps_latest_target_as_delta_base(self) -> None:
+        app = self.make_write_ready_app()
+        selection = make_selection()
+        monitor = make_monitor()
+        app.target_volume = 23
+        app._pending_target_volume = 23
+        app._volume_write_inflight = True
+        app._busy = True
+        app._update_monitor_list = Mock()
+        app._remember_selected_monitor = Mock()
+        app._update_hotkey_state = Mock()
+        app._start_volume_write = Mock()
+
+        MonitorVolumeApp._finish_volume_write_success(
+            app,
+            ([monitor], 0, 21, selection),
+            generation=4,
+        )
+
+        self.assertEqual(app.current_volume, 21)
+        self.assertEqual(app.target_volume, 23)
+        self.assertEqual(app._current_target_volume(), 23)
+        app._start_volume_write.assert_called_once_with(selection, 23)
+
     def test_display_event_invalidates_immediately_and_schedules_refresh(self) -> None:
         app = MonitorVolumeApp.__new__(MonitorVolumeApp)
         app._closing = False

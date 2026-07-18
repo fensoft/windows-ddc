@@ -152,7 +152,7 @@ The callback passes unrelated keys directly to `CallNextHookEx`. It recognizes o
 - `VK_VOLUME_DOWN` (`0xAE`)
 - `VK_VOLUME_UP` (`0xAF`)
 
-When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys pass onward. If a previously configured target is unavailable, the first key-down in that invalid period also queues an error overlay without consuming the event. The notice is latched until readiness is restored or a new invalidation begins. On a consumed press, repeated key-down and matching key-up retain the initial consume decision; readiness loss stops new deltas but does not split a press between the app and Windows. The mute key is not recognized.
+When `MonitorVolumeApp._should_consume_volume_keys()` is false, those keys pass onward. If a previously configured target is unavailable, the first key-down in that invalid period also queues an error overlay without consuming the event. The notice is latched until readiness is restored or a new invalidation begins. On a consumed press, repeated key-down and matching key-up retain the initial consume decision; readiness loss stops new deltas but does not split a press between the app and Windows. The hook's step value is updated through a lock-protected setter when Tk handles the `+1`/`+2`/`+3` selector event, so the native thread never reads Tk state. The mute key is not recognized.
 
 The callback does not inspect the `KBDLLHOOKSTRUCT.flags` injection bits. Synthesized Volume Down/Up events are therefore handled like physical-key events.
 
@@ -198,7 +198,7 @@ The control window is a non-resizable Tk/ttk layout at least 520 pixels wide so 
 - a read-only monitor combobox;
 - Refresh;
 - a `0`–`100` scale;
-- one-point decrement/increment buttons;
+- a non-persistent `+1`/`+2`/`+3` step selector and decrement/increment buttons;
 - a percentage label and status bar.
 
 Widget state derives from `_busy`, monitor availability, confirmed volume, display-listener liveness, and topology validity. During a valid active write the volume controls remain enabled so a new last target can be queued.

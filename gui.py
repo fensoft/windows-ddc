@@ -46,6 +46,7 @@ class DisplayTopologyChanged(RuntimeError):
 
 class MonitorVolumeApp:
     STEP_SIZE = 1
+    STEP_OPTIONS = (1, 2, 3)
     TRAY_TOOLTIP = "windows-ddc"
     DISPLAY_CHANGE_DEBOUNCE_MS = 500
     REFRESH_RETRY_DELAYS_MS = (1000, 2000, 4000)
@@ -66,6 +67,7 @@ class MonitorVolumeApp:
         self.selected_key: SavedMonitorSelection | None = None
         self.current_volume: int | None = None
         self.target_volume: int | None = None
+        self.volume_step = self.STEP_SIZE
         self.app_icon_path: Path | None = None
         self._busy = False
         self._closing = False
@@ -94,6 +96,7 @@ class MonitorVolumeApp:
         self.monitor_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=0.0)
         self.volume_text_var = tk.StringVar(value="--")
+        self.volume_step_var = tk.StringVar(value=f"+{self.volume_step}")
         self.status_var = tk.StringVar(value="Searching for monitors...")
 
         self.app_icon_path = apply_app_icon(self.root)
@@ -138,6 +141,18 @@ class MonitorVolumeApp:
 
         ttk.Label(content, text="Volume:").grid(row=2, column=0, sticky="w", pady=(14, 0))
 
+        ttk.Label(content, text="Step:").grid(row=2, column=1, sticky="e", pady=(14, 0))
+
+        self.volume_step_combo = ttk.Combobox(
+            content,
+            textvariable=self.volume_step_var,
+            values=tuple(f"+{step}" for step in self.STEP_OPTIONS),
+            state="readonly",
+            width=4,
+        )
+        self.volume_step_combo.grid(row=2, column=2, sticky="w", padx=(4, 8), pady=(14, 0))
+        self.volume_step_combo.bind("<<ComboboxSelected>>", self.on_volume_step_selected)
+
         self.volume_value_label = ttk.Label(
             content,
             textvariable=self.volume_text_var,
@@ -150,7 +165,7 @@ class MonitorVolumeApp:
             content,
             text="-",
             width=4,
-            command=lambda: self.adjust_selected_volume(-self.STEP_SIZE),
+            command=lambda: self.adjust_selected_volume(-self.volume_step),
         )
         self.decrease_button.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
@@ -171,7 +186,7 @@ class MonitorVolumeApp:
             content,
             text="+",
             width=4,
-            command=lambda: self.adjust_selected_volume(self.STEP_SIZE),
+            command=lambda: self.adjust_selected_volume(self.volume_step),
         )
         self.increase_button.grid(row=3, column=3, sticky="e", pady=(6, 0))
 
@@ -229,7 +244,7 @@ class MonitorVolumeApp:
             on_delta=self._queue_hotkey_delta,
             should_consume=self._should_consume_volume_keys,
             on_error=self._handle_listener_error_from_thread,
-            step=self.STEP_SIZE,
+            step=self.volume_step,
             on_unavailable=self._queue_unavailable_hotkey_notice,
             should_report_unavailable=self._should_report_unavailable_hotkey,
         )
@@ -238,6 +253,19 @@ class MonitorVolumeApp:
         except Exception as exc:
             self._listener = None
             self._set_status(self._format_error(exc))
+
+    def on_volume_step_selected(self, _event: Any = None) -> None:
+        try:
+            selected_step = int(self.volume_step_var.get().removeprefix("+"))
+        except ValueError:
+            selected_step = self.STEP_SIZE
+
+        if selected_step not in self.STEP_OPTIONS:
+            selected_step = self.STEP_SIZE
+        self.volume_step = selected_step
+        self.volume_step_var.set(f"+{selected_step}")
+        if self._listener is not None:
+            self._listener.set_step(selected_step)
 
     def _handle_display_change_from_thread(self) -> None:
         self._invalidate_topology_generation()
@@ -784,7 +812,6 @@ class MonitorVolumeApp:
 
         self._update_monitor_list(monitors, selected_index)
         self.current_volume = new_volume
-        self.target_volume = new_volume
         self._remember_selected_monitor(selection)
         self._hotkeys_ready = True
         self._control_unavailable_reason = None
@@ -792,12 +819,17 @@ class MonitorVolumeApp:
 
         next_target = self._pending_target_volume
         if next_target is not None and next_target != new_volume:
+            # Keep the newest requested value authoritative while its follow-up
+            # write is validated. Resetting this to the older readback makes
+            # rapid +/- events calculate from a value that is one write behind.
+            self.target_volume = next_target
             self._pending_target_volume = None
             self._volume_write_inflight = False
             self._busy = False
             self._start_volume_write(selection, next_target)
             return
 
+        self.target_volume = new_volume
         self._volume_write_inflight = False
         self._pending_target_volume = None
         self._busy = False
