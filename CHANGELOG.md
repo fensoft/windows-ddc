@@ -13,6 +13,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Added EDID/device-path monitor identity, display/device change notifications, error overlays, and hardware-free identity/settings/revalidation coverage.
 - Added a `+1`/`+2`/`+3` volume-step selector for the GUI buttons and global volume keys.
 - Added hardware-free tray acknowledgement, fallback, timeout, and Explorer-restart recovery coverage.
+- Added hardware-free coverage for queued-callback containment, DDC watchdog behavior, bounded native-thread lifecycle waits, and shutdown diagnostics.
 
 ### Changed
 
@@ -22,6 +23,8 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Replaced description/ordinal persistence with backward-compatible schema-version-2 stable identity matching; missing or ambiguous targets now fail closed instead of selecting another monitor.
 - Reacquire and exact-match fresh monitor wrappers before every actual DDC write, reject stale topology generations, and automatically rediscover after display changes or uncertain writes.
 - Wait for confirmed tray-icon addition before withdrawing Tk, restore the main window on tray failures, and re-add visible icons after Explorer recreates the taskbar.
+- Bound native listener startup and shutdown waits, keep Tk queue polling alive after individual callback failures, and report native threads that miss the shutdown deadline.
+- Disable monitor control after a 10-second DDC watchdog timeout, retain the single-worker serialization slot until the native call returns, ignore its late result, and then perform read-only rediscovery.
 
 ## [0.1.0] - 2026-03-22
 

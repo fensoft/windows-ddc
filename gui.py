@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -49,6 +50,7 @@ class MonitorVolumeApp:
     STEP_OPTIONS = (1, 2, 3)
     TRAY_TOOLTIP = "windows-ddc"
     DISPLAY_CHANGE_DEBOUNCE_MS = 500
+    DDC_OPERATION_TIMEOUT_MS = 10_000
     REFRESH_RETRY_DELAYS_MS = (1000, 2000, 4000)
 
     def __init__(self, root: tk.Tk) -> None:
@@ -85,6 +87,11 @@ class MonitorVolumeApp:
         self._in_tray = False
         self._poll_after_id: str | None = None
         self._refresh_after_id: str | None = None
+        self._ddc_timeout_after_id: str | None = None
+        self._ddc_operation_sequence = 0
+        self._active_ddc_operation_id: int | None = None
+        self._active_ddc_operation_kind: str | None = None
+        self._ddc_operation_timed_out = False
         self._refresh_retry_index = 0
         self._refresh_requested = False
         self._refresh_requested_automatic = False
@@ -381,30 +388,69 @@ class MonitorVolumeApp:
         if self._closing:
             return
 
-        while True:
-            try:
-                callback = self._result_queue.get_nowait()
-            except queue.Empty:
-                break
-            callback()
-
-        if self._hotkeys_enabled and (not self._busy or self._volume_write_inflight):
-            pending_delta = 0
+        try:
             while True:
                 try:
-                    pending_delta += self._hotkey_delta_queue.get_nowait()
+                    callback = self._result_queue.get_nowait()
                 except queue.Empty:
                     break
-            if pending_delta:
-                self.adjust_selected_volume(pending_delta)
-        elif not self._hotkeys_enabled:
-            while True:
                 try:
-                    self._hotkey_delta_queue.get_nowait()
-                except queue.Empty:
-                    break
+                    callback()
+                except Exception as exc:
+                    self._report_ui_callback_error(exc)
 
-        self._poll_after_id = self.root.after(50, self._poll_queues)
+            if self._hotkeys_enabled and (not self._busy or self._volume_write_inflight):
+                pending_delta = 0
+                while True:
+                    try:
+                        pending_delta += self._hotkey_delta_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                if pending_delta:
+                    try:
+                        self.adjust_selected_volume(pending_delta)
+                    except Exception as exc:
+                        self._report_ui_callback_error(exc)
+            elif not self._hotkeys_enabled:
+                while True:
+                    try:
+                        self._hotkey_delta_queue.get_nowait()
+                    except queue.Empty:
+                        break
+        except Exception as exc:
+            self._report_ui_callback_error(exc)
+        finally:
+            if not self._closing:
+                try:
+                    self._poll_after_id = self.root.after(50, self._poll_queues)
+                except tk.TclError:
+                    self._poll_after_id = None
+
+    def _report_ui_callback_error(self, exc: Exception) -> None:
+        message = f"Internal UI callback failed: {self._format_error(exc)}"
+        try:
+            self._topology_valid.clear()
+            self._hotkeys_ready = False
+            self.current_volume = None
+            self.target_volume = None
+            if self._active_ddc_operation_id is None:
+                self._busy = False
+                self._volume_write_inflight = False
+                self._pending_target_volume = None
+            self._control_unavailable_reason = (
+                "An internal UI operation failed; monitor control is disabled until Refresh succeeds."
+            )
+            self._update_hotkey_state()
+            self._set_displayed_volume(None)
+            self._set_status(message)
+            self._apply_control_state()
+        except Exception:
+            pass
+
+        try:
+            self.root.report_callback_exception(type(exc), exc, exc.__traceback__)
+        except Exception:
+            print(message, file=sys.stderr)
 
     def _format_error(self, exc: Exception) -> str:
         message = str(exc).strip()
@@ -556,6 +602,79 @@ class MonitorVolumeApp:
             self._refresh_after_id = None
         self.refresh_monitors(automatic=automatic)
 
+    def _begin_ddc_operation(self, kind: str) -> int:
+        if self._active_ddc_operation_id is not None:
+            raise RuntimeError("A DDC operation is already active.")
+        self._ddc_operation_sequence += 1
+        operation_id = self._ddc_operation_sequence
+        self._active_ddc_operation_id = operation_id
+        self._active_ddc_operation_kind = kind
+        self._ddc_operation_timed_out = False
+        self._ddc_timeout_after_id = self.root.after(
+            self.DDC_OPERATION_TIMEOUT_MS,
+            lambda token=operation_id: self._handle_ddc_operation_timeout(token),
+        )
+        return operation_id
+
+    def _accept_ddc_completion(self, operation_id: int | None) -> bool:
+        # Optional IDs keep direct, hardware-free unit calls to the completion
+        # helpers useful while every real worker supplies a token.
+        if operation_id is None:
+            return True
+        if operation_id != self._active_ddc_operation_id:
+            return False
+
+        timed_out = self._ddc_operation_timed_out
+        if self._ddc_timeout_after_id is not None:
+            try:
+                self.root.after_cancel(self._ddc_timeout_after_id)
+            except tk.TclError:
+                pass
+        self._ddc_timeout_after_id = None
+        self._active_ddc_operation_id = None
+        self._active_ddc_operation_kind = None
+        self._ddc_operation_timed_out = False
+
+        if timed_out:
+            self._finish_timed_out_ddc_operation()
+            return False
+        return True
+
+    def _handle_ddc_operation_timeout(self, operation_id: int) -> None:
+        if self._closing or operation_id != self._active_ddc_operation_id:
+            return
+
+        operation_kind = self._active_ddc_operation_kind or "DDC"
+        self._ddc_timeout_after_id = None
+        self._ddc_operation_timed_out = True
+        self._invalidate_topology_generation()
+        self._hotkeys_ready = False
+        self.current_volume = None
+        self.target_volume = None
+        self._pending_target_volume = None
+        self._update_hotkey_state()
+        self._set_displayed_volume(None)
+        reason = (
+            f"{operation_kind} timed out. Monitor state is unknown; control remains disabled "
+            "until the DDC call returns and Refresh succeeds. Restart the app if it does not return."
+        )
+        self._control_unavailable_reason = reason
+        self._show_unavailable_error(reason)
+        self._apply_control_state()
+
+    def _finish_timed_out_ddc_operation(self) -> None:
+        if self._closing:
+            return
+        self._volume_write_inflight = False
+        self._pending_target_volume = None
+        self._busy = False
+        self._refresh_retry_index = 0
+        self._apply_control_state()
+        if self._refresh_requested:
+            self._run_deferred_refresh()
+        else:
+            self._schedule_refresh(self.DISPLAY_CHANGE_DEBOUNCE_MS, automatic=True)
+
     def refresh_monitors(
         self,
         automatic: bool = False,
@@ -586,6 +705,7 @@ class MonitorVolumeApp:
                 self._listener.reset_unavailable_notice()
         self._update_hotkey_state()
         self._set_busy(True, "Searching for monitors...")
+        operation_id = self._begin_ddc_operation("Monitor discovery")
 
         def runner() -> None:
             try:
@@ -602,25 +722,38 @@ class MonitorVolumeApp:
                         result = monitors, match, volume, None
             except Exception as exc:
                 self._post_to_ui(
-                    lambda error=exc, token=generation, retry=automatic: self._finish_refresh_error(
+                    lambda error=exc, token=generation, retry=automatic, operation=operation_id: self._finish_refresh_error(
                         error,
                         token,
                         retry,
+                        operation,
                     )
                 )
             else:
                 self._post_to_ui(
-                    lambda value=result, token=generation, retry=automatic: self._finish_refresh(
+                    lambda value=result, token=generation, retry=automatic, operation=operation_id: self._finish_refresh(
                         value,
                         token,
                         retry,
+                        operation,
                     )
                 )
 
-        threading.Thread(target=runner, name="ddc-gui-worker", daemon=True).start()
+        try:
+            threading.Thread(target=runner, name="ddc-gui-worker", daemon=True).start()
+        except Exception as exc:
+            self._finish_refresh_error(exc, generation, automatic, operation_id)
 
-    def _finish_refresh(self, result: RefreshResult, generation: int, automatic: bool) -> None:
+    def _finish_refresh(
+        self,
+        result: RefreshResult,
+        generation: int,
+        automatic: bool,
+        operation_id: int | None = None,
+    ) -> None:
         if self._closing:
+            return
+        if not self._accept_ddc_completion(operation_id):
             return
         self._busy = False
         if not self._is_topology_generation_current(generation):
@@ -702,8 +835,16 @@ class MonitorVolumeApp:
         self._apply_control_state()
         self._run_deferred_refresh()
 
-    def _finish_refresh_error(self, exc: Exception, generation: int, automatic: bool) -> None:
+    def _finish_refresh_error(
+        self,
+        exc: Exception,
+        generation: int,
+        automatic: bool,
+        operation_id: int | None = None,
+    ) -> None:
         if self._closing:
+            return
+        if not self._accept_ddc_completion(operation_id):
             return
         self._busy = False
         if not self._is_topology_generation_current(generation):
@@ -765,6 +906,7 @@ class MonitorVolumeApp:
         self._volume_write_inflight = True
         self._pending_target_volume = None
         self._set_busy(True, f"Validating monitor and setting volume to {target_volume}%...")
+        operation_id = self._begin_ddc_operation("Monitor volume write")
 
         def runner() -> None:
             try:
@@ -790,23 +932,35 @@ class MonitorVolumeApp:
                 result: WriteResult = monitors, match.index, new_volume, fresh_selection
             except Exception as exc:
                 self._post_to_ui(
-                    lambda error=exc, token=generation: self._finish_volume_write_error(
+                    lambda error=exc, token=generation, operation=operation_id: self._finish_volume_write_error(
                         error,
                         token,
+                        operation,
                     )
                 )
             else:
                 self._post_to_ui(
-                    lambda value=result, token=generation: self._finish_volume_write_success(
+                    lambda value=result, token=generation, operation=operation_id: self._finish_volume_write_success(
                         value,
                         token,
+                        operation,
                     )
                 )
 
-        threading.Thread(target=runner, name="ddc-volume-write", daemon=True).start()
+        try:
+            threading.Thread(target=runner, name="ddc-volume-write", daemon=True).start()
+        except Exception as exc:
+            self._finish_volume_write_error(exc, generation, operation_id)
 
-    def _finish_volume_write_success(self, result: WriteResult, generation: int) -> None:
+    def _finish_volume_write_success(
+        self,
+        result: WriteResult,
+        generation: int,
+        operation_id: int | None = None,
+    ) -> None:
         if self._closing:
+            return
+        if not self._accept_ddc_completion(operation_id):
             return
         monitors, selected_index, new_volume, selection = result
         if not self._is_topology_generation_current(generation) or not self._topology_valid.is_set():
@@ -851,8 +1005,11 @@ class MonitorVolumeApp:
         self,
         exc: Exception,
         generation: int | None = None,
+        operation_id: int | None = None,
     ) -> None:
         if self._closing:
+            return
+        if not self._accept_ddc_completion(operation_id):
             return
 
         if isinstance(exc, MonitorSelectionUnavailable) and exc.monitors is not None:
@@ -975,16 +1132,47 @@ class MonitorVolumeApp:
         if self._refresh_after_id is not None:
             self.root.after_cancel(self._refresh_after_id)
             self._refresh_after_id = None
+        if self._ddc_timeout_after_id is not None:
+            self.root.after_cancel(self._ddc_timeout_after_id)
+            self._ddc_timeout_after_id = None
+        shutdown_failures: list[str] = []
         if self._listener is not None:
-            self._listener.stop()
+            self._stop_native_controller("Volume-key listener", self._listener, shutdown_failures)
             self._listener = None
         if self._display_listener is not None:
-            self._display_listener.stop()
+            self._stop_native_controller(
+                "Display-change listener",
+                self._display_listener,
+                shutdown_failures,
+            )
             self._display_listener = None
         if self._tray_icon is not None:
-            self._tray_icon.stop()
+            self._stop_native_controller("Tray controller", self._tray_icon, shutdown_failures)
             self._tray_icon = None
+        if shutdown_failures:
+            message = "Shutdown warning: " + "; ".join(shutdown_failures)
+            print(message, file=sys.stderr)
+            try:
+                self._set_status(message)
+                self.root.update_idletasks()
+            except Exception:
+                pass
         if self._overlay is not None:
             self._overlay.close()
             self._overlay = None
         self.root.destroy()
+
+    @staticmethod
+    def _stop_native_controller(
+        name: str,
+        controller: Any,
+        failures: list[str],
+    ) -> None:
+        try:
+            stopped = controller.stop()
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            failures.append(f"{name} stop failed: {message}")
+        else:
+            if not stopped:
+                failures.append(f"{name} did not stop before the timeout")

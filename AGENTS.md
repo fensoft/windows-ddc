@@ -18,7 +18,7 @@ These instructions apply to the entire repository. Keep this file operational an
 3. `display-change-listener`, `tray-icon`, and `volume-key-hook` are long-lived daemon threads with native Win32 message loops.
 4. `ddc-gui-worker` and `ddc-volume-write` are short-lived daemon workers for blocking DDC/CI work.
 5. Worker and native-thread callbacks cross into Tk through `queue.Queue`; `_poll_queues()` drains them every 50 ms.
-6. Only one application-issued DDC operation should be active. Rapid writes are serialized and reduced to the latest `_pending_target_volume`.
+6. Only one application-issued DDC operation should be active. Rapid writes are serialized and reduced to the latest `_pending_target_volume`. A timed-out operation keeps the slot until its worker returns; its late result is ignored and followed by read-only rediscovery.
 7. A successful exact-identity volume read enables monitor control only while the display-change listener remains live and the topology generation is valid. If the native keyboard hook is also live, Volume Down/Up events are consumed instead of reaching Windows system audio.
 8. Confirmed tray-icon addition makes startup tray-first. Addition or recovery failure keeps/restores the main window; Explorer recreation re-adds a previously visible icon. Closing the restored window exits, while minimizing returns it to the tray after another confirmed add.
 
@@ -137,9 +137,10 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Preserve `_volume_write_inflight` / `_pending_target_volume` serialization. Do not introduce concurrent operations against the selected monitor wrapper.
 - Do not broaden key consumption beyond `_hotkeys_enabled`. Readiness also requires a live display listener and valid topology event. Display notification, Refresh start, selection clearing, listener error, write failure, and shutdown clear it. Preserve the per-press consume/pass-through decision through matching key-up and the one-notice unavailable latch. Test hook/display-listener failures, reads, writes, Refresh, disconnect, shutdown, and held keys across transitions.
 - Keep ctypes callback objects (`_wndproc` and `_hook_callback`) strongly referenced for their controllers' lifetimes. Incorrect ctypes signatures or callback lifetimes can crash the process.
-- Stop display, hook, and tray message loops before destroying Tk. Their current joins have two-second timeouts; DDC workers are daemon threads and are not joined.
+- Native display, hook, and tray startup waits and shutdown joins have two-second deadlines. Stop their message loops before destroying Tk and retain shutdown diagnostics when a thread misses its deadline; DDC workers are daemon threads and are not joined.
 - Do not assume a DDC error means no hardware change occurred. Set plus readback is not transactional.
 - Do not treat a topology generation check as cancellation. A native DDC call already in progress can still mutate hardware; stale completions must remain non-authoritative and trigger read-only rediscovery.
+- Preserve the DDC watchdog token until a timed-out worker actually returns. Do not start a concurrent replacement call, accept its late result, or automatically retry an uncertain write.
 - Do not assume a listed monitor supports volume. Enumeration precedes the selected monitor's volume read.
 - Display/device notifications trigger debounced discovery with bounded retries; every actual write also reacquires monitor wrappers. Do not claim that external OSD/program volume changes are polled.
 - Preserve the acknowledged tray-show handshake: never withdraw Tk until the tray thread confirms `Shell_NotifyIconW` success. Tray errors must keep or restore the main window, and a `TaskbarCreated` broadcast must re-add an icon that was intended to be visible.

@@ -13,11 +13,12 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 5. It independently starts the tray controller and global keyboard hook. Their failures remain nonfatal to the other subsystems.
 6. It schedules the recurring Tk queue poll and a one-shot initial monitor refresh after 50 ms.
 7. The refresh worker enumerates DDC wrappers and Windows monitor identities, exact-matches the saved target, and reads its volume. With no saved selection, automatic selection occurs only when exactly one verifiable monitor exists.
-8. The worker enqueues a completion callback. The Tk queue poll applies the monitor list, selection, displayed volume, readiness, and status text.
+8. The worker enqueues a tokened completion callback. The Tk queue poll applies the monitor list, selection, displayed volume, readiness, and status text.
 9. A volume request updates the UI optimistically, then a serialized worker reacquires all wrappers and exact-matches the identity before set/readback.
 10. The readback becomes authoritative. A coalesced follow-up starts another worker and therefore performs another fresh discovery/match.
 11. Display/device notifications invalidate a thread-safe topology generation immediately, release key consumption, clear pending writes, and schedule debounced discovery with bounded retries.
-12. Shutdown disables key consumption, cancels Tk timers, stops display/hook/tray loops, closes the overlay, and destroys Tk.
+12. A 10-second watchdog fails a stalled DDC operation closed without releasing its serialization slot; when the worker eventually returns, its result is ignored and read-only rediscovery follows.
+13. Shutdown disables key consumption, cancels Tk timers, stops display/hook/tray loops, reports missed stop deadlines, closes the overlay, and destroys Tk.
 
 ## Runtime process and thread ownership
 
@@ -32,13 +33,13 @@ Source execution uses one interactive process. The one-file Nuitka executable ad
 | `ddc-gui-worker` | One short-lived daemon per accepted refresh/selection read | Enumeration and selected-monitor volume reads | Enqueues success or failure callable |
 | `ddc-volume-write` | One short-lived daemon at a time | Selected-monitor set followed by readback | Enqueues write success or failure callable |
 
-`MonitorVolumeApp._result_queue` carries zero-argument callbacks into Tk. `_hotkey_delta_queue` carries `+1`/`-1` changes. `_poll_queues()` drains all result callbacks first, combines key deltas accumulated during the poll interval, then schedules itself again after 50 ms.
+`MonitorVolumeApp._result_queue` carries zero-argument callbacks into Tk. `_hotkey_delta_queue` carries signed step changes. `_poll_queues()` drains all result callbacks first, combines key deltas accumulated during the poll interval, then schedules itself again after 50 ms. Each callback and the combined adjustment are caught independently; a failure is reported through Tk's callback reporter, fails monitor control closed, and the next poll is scheduled from `finally`.
 
-The `_busy` flag prevents a new refresh/selection worker while another general operation is active. Volume controls remain usable during an active volume write, but they update `_pending_target_volume` rather than starting another DDC worker. This is the application's serialization boundary; there is no separate DDC lock.
+The `_busy` flag prevents a new refresh/selection worker while another general operation is active. Volume controls remain usable during a valid active volume write, but they update `_pending_target_volume` rather than starting another DDC worker. A token identifies the one application-issued DDC operation, and a Tk watchdog tracks it. A timeout disables controls and interception but deliberately retains the token and busy/write flags until the uncancellable worker returns. This is the application's serialization boundary; there is no separate DDC lock.
 
-Display, tray, and hook threads are explicitly stopped and joined with two-second timeouts. DDC workers are daemon threads and are not cancelled or joined; `_closing` drops their eventual callbacks.
+Display, tray, and hook startup readiness waits and shutdown joins each have two-second deadlines. Stop methods report whether their native thread exited; shutdown writes missed deadlines or stop exceptions to standard error and the status bar before destroying Tk. DDC workers are daemon threads and are not cancelled or joined; `_closing` drops their eventual callbacks.
 
-All Tk calls must remain on the Tk thread. A native or DDC thread must enqueue work rather than touching widgets. Queued callbacks also need to remain exception-safe: `_poll_queues()` does not wrap each callback, so an exception can prevent the next poll from being scheduled.
+All Tk calls must remain on the Tk thread. A native or DDC thread must enqueue work rather than touching widgets. Queued callbacks must remain small and exception-safe even though the polling boundary now contains and reports their failures.
 
 ## Application entrypoints and composition
 
@@ -140,8 +141,11 @@ A request follows this sequence:
 7. Success is accepted only if the generation remains current. A distinct pending target starts another worker and another discovery/match.
 8. When no follow-up remains, confirmed readback is displayed and readiness is restored.
 9. Missing/ambiguous identity, DDC failure, or a stale generation clears pending state, marks volume unknown, releases interception, shows an unavailable overlay, and schedules read-only rediscovery.
+10. If the 10-second watchdog fires first, the operation token remains active and no new worker can start. The late completion is non-authoritative; only after it arrives is the slot released and a read-only refresh scheduled.
 
 This last-target-wins design limits DDC traffic while ensuring every actual hardware write—not every key-repeat message—uses fresh handles. An in-flight native DDC call cannot be cancelled; generation checks reduce but cannot remove the final check-to-write race.
+
+The watchdog bounds how long readiness remains trusted; it does not cancel or terminate the native DDC call.
 
 ## Global keyboard event flow
 
@@ -187,7 +191,7 @@ There is no user preference to disable the hook while leaving the app running. D
 
 The controller tries to load `windows-ddc.ico` at the Windows small-icon dimensions and falls back to `IDI_APPLICATION`. The main Tk window also tries the same tracked icon; icon failure is nonfatal.
 
-The tray's native window is created synchronously from the caller's perspective because `start()` waits for `_ready`. `show()` creates a per-request completion event, posts `WM_TRAY_SHOW`, and waits up to two seconds for the tray thread's actual `Shell_NotifyIconW` result. `MonitorVolumeApp.minimize_to_tray()` withdraws Tk only after that acknowledgement. A native failure, stopped controller, post failure, or timeout keeps/restores and normalizes the main window, hides any late icon best-effort, and reports the error in the visible status bar.
+The tray's native window is created synchronously from the caller's perspective because `start()` waits up to two seconds for `_ready`. `show()` creates a per-request completion event, posts `WM_TRAY_SHOW`, and waits up to two seconds for the tray thread's actual `Shell_NotifyIconW` result. `MonitorVolumeApp.minimize_to_tray()` withdraws Tk only after that acknowledgement. A native failure, stopped controller, post failure, or timeout keeps/restores and normalizes the main window, hides any late icon best-effort, and reports the error in the visible status bar.
 
 The controller registers the shell's `TaskbarCreated` message during construction. When Explorer recreates the taskbar, a previously visible icon is re-added with `NIM_ADD` and its notification version is restored. If re-registration fails, the error crosses the queue boundary and Tk restores the main window instead of leaving the process unreachable.
 
@@ -327,14 +331,14 @@ Volume-control readiness requires a live display listener, valid topology genera
 Known failure-state caveats include:
 
 - an in-flight native DDC call cannot be cancelled, so a topology event can race with the final pre-write generation check;
+- a DDC call that never returns keeps monitor control disabled until the application is restarted; the worker stays daemonized and no concurrent replacement call is started;
 - if Windows emits no notification before a first post-change press, that press can be consumed while asynchronous revalidation rejects the write; subsequent presses pass through;
-- `start()` waits on native readiness events without a timeout;
 - a set may succeed before its readback fails;
-- an exception in a queued Tk callback can stop recurring queue polling.
+- the packaged executable has no console or file logger, so shutdown diagnostics are primarily useful in source runs and may be visible only briefly in the status bar.
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, topology generations, display-message routing, fresh-wrapper writes, acknowledged tray addition, visible-window fallback, and Explorer restart recovery. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, topology generations, display-message routing, fresh-wrapper writes, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, and shutdown diagnostics. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 

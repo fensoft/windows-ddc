@@ -28,6 +28,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 - Invalidates monitor control on Windows display/device notifications and reacquires fresh DDC handles before every actual write.
 - Follows the current user's Windows light/dark application preference at startup.
 - Keeps DDC/CI work off Tk's UI thread and coalesces rapid volume changes.
+- Fails closed on stalled DDC calls or internal UI callbacks, with bounded native-thread lifecycle waits.
 
 > [!IMPORTANT]
 > Once a monitor has been selected and its volume read successfully, Volume Up and Volume Down are consumed globally by this application. They no longer change Windows system volume until the application is exited or loses readiness. The mute key is not intercepted.
@@ -98,7 +99,7 @@ With no saved selection, the app selects automatically only when exactly one ver
 
 | Action | Behavior |
 | --- | --- |
-| Start | Creates display-change, tray, and keyboard-hook threads, waits up to two seconds for confirmed tray-icon addition before hiding, then discovers monitors in the background. |
+| Start | Creates display-change, tray, and keyboard-hook threads with two-second startup deadlines, waits up to two seconds for confirmed tray-icon addition before hiding, then discovers monitors in the background. |
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
 | Change volume | Choose a `+1`, `+2`, or `+3` step, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
@@ -112,6 +113,8 @@ Monitor discovery is event-driven rather than periodic. Windows display and moni
 The volume step defaults to `+1` on every launch. The selected step applies to both the on-screen `-`/`+` buttons and the global Volume Down/Up keys; it is not saved in `settings.json`.
 
 A DDC write and its readback are not transactional. If the write succeeds but readback fails, or if the display changes during an in-flight call, the monitor may already have changed. The application reports that uncertainty in the overlay and status bar, replaces the displayed value with `--`, releases global key interception, and performs read-only rediscovery without retrying the write. Volume changes are not rolled back when the application exits.
+
+Every discovery/read or write/readback worker has a 10-second UI watchdog. A timeout marks the volume unknown and releases global key interception, but the app keeps that worker's serialization slot because the underlying native DDC call cannot be cancelled safely. Its eventual result is ignored and followed by read-only rediscovery. If it never returns, restart the application; no concurrent DDC operation is started against the monitor meanwhile.
 
 The UI range is `0`–`100`, but a monitor can report a lower device maximum and reject a higher target. That dependency error is shown in the status bar.
 
@@ -128,6 +131,8 @@ There is no separate health command, readiness endpoint, log file, or console in
 | `Selected monitor ... ambiguous/not found` | No substitute target was chosen; select the monitor again or reconnect it. |
 | `Display-change listener failed: ...` | All monitor-volume writes are disabled because reset protection is unavailable. |
 | `Tray icon failed: ...` | Tray initialization, addition, or recovery failed; the main window remains visible or is restored. |
+| `... timed out. Monitor state is unknown...` | A native DDC call exceeded 10 seconds. Control stays disabled until it returns and automatic Refresh succeeds; restart if it remains stuck. |
+| `Internal UI callback failed: ...` | One queued UI operation failed. Queue polling continues, but monitor control remains disabled until Refresh succeeds. |
 | A read/write/detection error | The underlying operation failed; the status contains the formatted exception text. |
 | `Volume-key listener failed: ...` | The global hook failed. The GUI may still control the monitor. |
 
@@ -283,6 +288,8 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | The tray icon cannot be added or disappears | The main window remains visible or is restored automatically. After Explorer restarts, the app re-adds an icon that was visible; if recovery fails, read the restored window's status bar. |
 | `No DDC/CI monitors found.` | Enable DDC/CI in the monitor OSD, confirm the monitor exposes DDC/CI over the active connection, then choose **Refresh**. |
 | A monitor is listed but volume remains `--` | Enumeration succeeded but its volume read did not. Read the status, try another monitor, and confirm the target supports DDC/CI audio volume. |
+| A monitor operation timed out | Wait for automatic Refresh. If the status does not change because the native DDC call never returns, restart the app; it intentionally will not start another hardware call concurrently. |
+| `Internal UI callback failed` | Restore the window and choose **Refresh**. Polling continues, but monitor control fails closed until a successful refresh. |
 | `Display-change listener failed` | Monitor writes intentionally remain disabled because the app cannot provide reset protection. Restart the app; if it repeats, use Windows system volume instead. |
 | `monitorcontrol is not installed...` | From the repository root, rerun `python -m pip install -e .`. |
 | Volume keys still change Windows audio | Restore the UI and wait for a successful volume read. If `Volume-key listener failed` appeared, the buttons/slider may work but global keys will not. |

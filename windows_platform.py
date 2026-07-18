@@ -64,6 +64,8 @@ DICS_FLAG_GLOBAL = 0x00000001
 DIREG_DEV = 0x00000001
 KEY_READ = 0x00020019
 REG_BINARY = 3
+NATIVE_START_TIMEOUT_SECONDS = 2.0
+NATIVE_STOP_TIMEOUT_SECONDS = 2.0
 
 BYTE = ctypes.c_ubyte
 UINT_PTR = ctypes.c_size_t
@@ -639,6 +641,9 @@ def get_toplevel_window_handle(hwnd: int) -> int:
 
 
 class DisplayChangeListener:
+    START_TIMEOUT_SECONDS = NATIVE_START_TIMEOUT_SECONDS
+    STOP_TIMEOUT_SECONDS = NATIVE_STOP_TIMEOUT_SECONDS
+
     def __init__(
         self,
         on_change: Callable[[], None],
@@ -651,6 +656,7 @@ class DisplayChangeListener:
         self._wndproc = WNDPROC(self._window_proc)
         self._ready = threading.Event()
         self._active = threading.Event()
+        self._stop_requested = threading.Event()
         self._thread = threading.Thread(
             target=self._message_loop,
             name="display-change-listener",
@@ -664,9 +670,13 @@ class DisplayChangeListener:
     def is_active(self) -> bool:
         return self._active.is_set()
 
-    def start(self) -> None:
+    def start(self, timeout: float = START_TIMEOUT_SECONDS) -> None:
+        if timeout <= 0:
+            raise ValueError("Display-listener start timeout must be positive.")
         self._thread.start()
-        self._ready.wait()
+        if not self._ready.wait(timeout):
+            self._request_stop()
+            raise PlatformError("Timed out while starting the display-change listener.")
         if self._start_error is not None:
             raise PlatformError(
                 f"Failed to initialize display-change listener: {self._start_error}"
@@ -674,12 +684,19 @@ class DisplayChangeListener:
         if self._hwnd is None or not self._active.is_set():
             raise PlatformError("Failed to initialize display-change listener.")
 
-    def stop(self) -> None:
+    def _request_stop(self) -> None:
+        self._stop_requested.set()
         self._active.clear()
         if self._hwnd is not None:
             user32.PostMessageW(self._hwnd, WM_DISPLAY_LISTENER_EXIT, 0, 0)
+
+    def stop(self, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
+        if timeout < 0:
+            raise ValueError("Display-listener stop timeout cannot be negative.")
+        self._request_stop()
         if self._thread.is_alive():
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
     def _message_loop(self) -> None:
         class_registered = False
@@ -738,12 +755,13 @@ class DisplayChangeListener:
             return
 
         self._notification_handle = notification_handle
-        self._active.set()
+        if not self._stop_requested.is_set():
+            self._active.set()
         self._ready.set()
 
         message = wintypes.MSG()
         try:
-            while True:
+            while not self._stop_requested.is_set():
                 result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
                 if result == -1:
                     raise win_error("Display listener GetMessageW failed")
@@ -797,6 +815,8 @@ class TrayIconController:
     MENU_RESTORE = 1001
     MENU_EXIT = 1002
     SHOW_TIMEOUT_SECONDS = 2.0
+    START_TIMEOUT_SECONDS = NATIVE_START_TIMEOUT_SECONDS
+    STOP_TIMEOUT_SECONDS = NATIVE_STOP_TIMEOUT_SECONDS
 
     def __init__(
         self,
@@ -818,6 +838,7 @@ class TrayIconController:
         if not self._taskbar_created_message:
             raise PlatformError("Failed to register the TaskbarCreated message.")
         self._ready = threading.Event()
+        self._stop_requested = threading.Event()
         self._thread = threading.Thread(target=self._message_loop, name="tray-icon", daemon=True)
         self._start_error: Exception | None = None
         self._hwnd: wintypes.HWND | None = None
@@ -832,12 +853,16 @@ class TrayIconController:
     def is_visible(self) -> bool:
         return self._icon_visible
 
-    def start(self) -> None:
+    def start(self, timeout: float = START_TIMEOUT_SECONDS) -> None:
+        if timeout <= 0:
+            raise ValueError("Tray start timeout must be positive.")
         self._thread.start()
-        self._ready.wait()
+        if not self._ready.wait(timeout):
+            self._request_stop()
+            raise PlatformError("Timed out while starting the tray controller.")
         if self._start_error is not None:
             raise PlatformError(f"Failed to initialize tray icon: {self._start_error}") from self._start_error
-        if self._hwnd is None:
+        if self._hwnd is None or self._stop_requested.is_set():
             raise PlatformError("Failed to initialize tray icon.")
 
     def show(self, timeout: float = SHOW_TIMEOUT_SECONDS) -> None:
@@ -874,11 +899,18 @@ class TrayIconController:
         if self._hwnd is not None:
             user32.PostMessageW(self._hwnd, WM_TRAY_HIDE, 0, 0)
 
-    def stop(self) -> None:
+    def _request_stop(self) -> None:
+        self._stop_requested.set()
         if self._hwnd is not None:
             user32.PostMessageW(self._hwnd, WM_TRAY_EXIT, 0, 0)
+
+    def stop(self, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
+        if timeout < 0:
+            raise ValueError("Tray stop timeout cannot be negative.")
+        self._request_stop()
         if self._thread.is_alive():
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
     def _message_loop(self) -> None:
         class_registered = False
@@ -923,7 +955,7 @@ class TrayIconController:
         self._ready.set()
 
         message = wintypes.MSG()
-        while True:
+        while not self._stop_requested.is_set():
             result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
             if result == -1:
                 self.on_error(win_error("Tray GetMessageW failed"))
@@ -933,7 +965,10 @@ class TrayIconController:
             user32.TranslateMessage(ctypes.byref(message))
             user32.DispatchMessageW(ctypes.byref(message))
 
-        self._hwnd = None
+        if self._hwnd is not None:
+            self._hide_icon(self._hwnd)
+            user32.DestroyWindow(self._hwnd)
+            self._hwnd = None
         self._fail_show_requests(PlatformError("Tray controller stopped before showing the icon."))
         if class_registered:
             user32.UnregisterClassW(self._class_name, self._instance)
@@ -977,6 +1012,7 @@ class TrayIconController:
                 return 0
         if msg == WM_DESTROY:
             self._hide_icon(hwnd)
+            self._hwnd = None
             user32.PostQuitMessage(0)
             return 0
         return user32.DefWindowProcW(hwnd, msg, w_param, l_param)
@@ -1087,6 +1123,9 @@ class TrayIconController:
 
 
 class GlobalVolumeKeyListener:
+    START_TIMEOUT_SECONDS = NATIVE_START_TIMEOUT_SECONDS
+    STOP_TIMEOUT_SECONDS = NATIVE_STOP_TIMEOUT_SECONDS
+
     def __init__(
         self,
         on_delta: Callable[[int], None],
@@ -1129,21 +1168,31 @@ class GlobalVolumeKeyListener:
         with self._step_lock:
             return self._step
 
-    def start(self) -> None:
+    def start(self, timeout: float = START_TIMEOUT_SECONDS) -> None:
+        if timeout <= 0:
+            raise ValueError("Keyboard-hook start timeout must be positive.")
         self._thread.start()
-        self._hook_ready.wait()
+        if not self._hook_ready.wait(timeout):
+            self._request_stop()
+            raise PlatformError("Timed out while starting the keyboard hook.")
         if self._start_error is not None:
             raise PlatformError(f"Failed to install keyboard hook: {self._start_error}") from self._start_error
-        if self._hook_handle is None:
+        if self._hook_handle is None or not self._hook_active.is_set():
             raise PlatformError("Failed to install keyboard hook.")
 
-    def stop(self) -> None:
+    def _request_stop(self) -> None:
         self._stop_event.set()
         self._hook_active.clear()
         if self._hook_thread_id:
             user32.PostThreadMessageW(self._hook_thread_id, WM_QUIT, 0, 0)
+
+    def stop(self, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
+        if timeout < 0:
+            raise ValueError("Keyboard-hook stop timeout cannot be negative.")
+        self._request_stop()
         if self._thread.is_alive():
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
     def reset_unavailable_notice(self) -> None:
         self._unavailable_notice_reported.clear()
@@ -1158,7 +1207,8 @@ class GlobalVolumeKeyListener:
             return
 
         self._hook_handle = hook_handle
-        self._hook_active.set()
+        if not self._stop_event.is_set():
+            self._hook_active.set()
         self._hook_ready.set()
 
         message = wintypes.MSG()

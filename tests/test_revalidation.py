@@ -63,6 +63,13 @@ class RevalidationTests(unittest.TestCase):
         app.current_volume = 50
         app._volume_write_inflight = False
         app._pending_target_volume = None
+        app.root = Mock()
+        app.root.after.return_value = "ddc-timeout"
+        app._ddc_timeout_after_id = None
+        app._ddc_operation_sequence = 0
+        app._active_ddc_operation_id = None
+        app._active_ddc_operation_kind = None
+        app._ddc_operation_timed_out = False
         app._set_busy = Mock()
         app._show_unavailable_error = Mock()
         app._post_to_ui = lambda callback: callback()
@@ -83,9 +90,10 @@ class RevalidationTests(unittest.TestCase):
 
         enumerate_mock.assert_called_once_with()
         set_mock.assert_called_once_with(fresh_monitor, 51)
-        result, generation = app._finish_volume_write_success.call_args.args
+        result, generation, operation_id = app._finish_volume_write_success.call_args.args
         self.assertEqual(result, ([fresh_monitor], 0, 51, fresh_monitor.selection_key))
         self.assertEqual(generation, 4)
+        self.assertEqual(operation_id, 1)
 
     def test_topology_invalidation_before_set_aborts_without_writing(self) -> None:
         app = self.make_write_ready_app()
@@ -102,9 +110,10 @@ class RevalidationTests(unittest.TestCase):
             app._start_volume_write(make_selection(), 51)
 
         set_mock.assert_not_called()
-        error, generation = app._finish_volume_write_error.call_args.args
+        error, generation, operation_id = app._finish_volume_write_error.call_args.args
         self.assertIsInstance(error, DisplayTopologyChanged)
         self.assertEqual(generation, 4)
+        self.assertEqual(operation_id, 1)
 
     def test_coalesced_write_keeps_latest_target_as_delta_base(self) -> None:
         app = self.make_write_ready_app()
