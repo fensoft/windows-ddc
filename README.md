@@ -30,6 +30,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 - Keeps DDC/CI work off Tk's UI thread and coalesces rapid volume changes.
 - Fails closed on stalled DDC calls or internal UI callbacks, with bounded native-thread lifecycle waits.
 - Allows one instance per Windows session; launching it again restores the existing control window instead of starting competing hooks or DDC workers.
+- Keeps a small rotating per-user diagnostic log for the console-free executable.
 
 > [!IMPORTANT]
 > Once a monitor has been selected and its volume read successfully, Volume Up and Volume Down are consumed globally by this application. They no longer change Windows system volume until the application is exited or loses readiness. The mute key is not intercepted.
@@ -44,7 +45,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 | Source packaging | setuptools with flat `py-modules` |
 | Executable build | `Nuitka==2.4.8`, one-file Windows executable |
 | Continuous integration | GitHub Actions on `windows-latest`, Python 3.10 and 3.14 |
-| Persistent app data | One per-user JSON settings file |
+| Persistent app data | Per-user JSON settings and rotating diagnostic logs |
 
 The runtime is one interactive user-session process. It is not a Windows service and does not open a port, expose an HTTP API, use a database, or contact a runtime network service. See [Architecture](docs/ARCHITECTURE.md) for the process, thread, and event flows.
 
@@ -122,7 +123,7 @@ The UI range is `0`–`100`, but a monitor can report a lower device maximum and
 
 ## Startup validation and status
 
-There is no separate health command, readiness endpoint, log file, or console in the packaged executable. The control window's status bar is the diagnostic surface.
+There is no separate health command, readiness endpoint, or console in the packaged executable. The control window's status bar is the immediate health surface, and a rotating per-user log retains lifecycle and failure diagnostics across runs.
 
 | Status shape | Meaning |
 | --- | --- |
@@ -142,11 +143,12 @@ Volume controls remain disabled until the display-change listener is live and th
 
 ## Configuration and persistent data
 
-There are no application-specific environment variables, CLI flags, environment templates, or administrative settings. The only environment input is the standard Windows `APPDATA` location used to place the settings file.
+There are no application-specific environment variables, CLI flags, environment templates, or administrative settings. Standard Windows `APPDATA` and `LOCALAPPDATA` locations determine where the settings and diagnostic files are stored.
 
 | Input or field | Default | Effect |
 | --- | --- | --- |
 | `APPDATA` | If unset or empty, `Path.home()` | Base directory for the `windows-ddc` settings folder. |
+| `LOCALAPPDATA` | Falls back to `APPDATA`, then `Path.home()` | Base directory for the rotating diagnostic log. |
 | `schema_version` | `2` for newly written settings | Selects the stable-identity settings schema. |
 | `change_speed` | `slow` | Persistent `slow` (`+1`), `medium` (`+2`), or `fast` (`+3`) volume-change preference. |
 | `selected_monitor.description` | No saved value | Human-readable description; used for safe migration of unique legacy selections. |
@@ -190,6 +192,12 @@ Legacy description/ordinal files remain readable. A legacy selection is promoted
 Missing, unreadable, syntactically invalid, non-object, unknown-version, or invalid nested monitor settings are treated as no selection. JSON booleans are not accepted as legacy ordinals. A missing or invalid `change_speed` independently defaults to `slow`.
 
 The settings file contains monitor selection and change-speed preference, not volume, credentials, or secrets. The actual volume is monitor hardware state and is read again at startup.
+
+### Diagnostic log
+
+The normal log path is `%LOCALAPPDATA%\windows-ddc\windows-ddc.log`. If `LOCALAPPDATA` is unavailable, it falls back to `APPDATA` and then the current user's home directory. The current file is capped at 512 KiB and keeps two rotated backups named `windows-ddc.log.1` and `windows-ddc.log.2`.
+
+Routine entries contain timestamps, severity, thread/component names, lifecycle events, subsystem failures, and exception classes. They do not deliberately include monitor descriptions or device paths. An unexpected top-level exception can include a traceback or local source paths, so inspect logs before sharing them. If the log directory or file cannot be created, logging is silently disabled and the application continues; the status bar remains available.
 
 ## Backup and restore
 
@@ -256,11 +264,11 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, topology generations, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, or contacts monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, diagnostics rotation, topology generations, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, or contacts monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall -q app.py ddc.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
+python -m compileall -q app.py ddc.py diagnostics.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
 python -m pip check
 git diff --check
 git diff --cached --check
@@ -297,6 +305,7 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | A monitor is listed but volume remains `--` | Enumeration succeeded but its volume read did not. Read the status, try another monitor, and confirm the target supports DDC/CI audio volume. |
 | A monitor operation timed out | Wait for automatic Refresh. If the status does not change because the native DDC call never returns, restart the app; it intentionally will not start another hardware call concurrently. |
 | `Internal UI callback failed` | Restore the window and choose **Refresh**. Polling continues, but monitor control fails closed until a successful refresh. |
+| A failure disappears from the status bar | Review `%LOCALAPPDATA%\windows-ddc\windows-ddc.log` and its two backups. If that directory was unavailable, logging may have been disabled without blocking startup. |
 | `Display-change listener failed` | Monitor writes intentionally remain disabled because the app cannot provide reset protection. Restart the app; if it repeats, use Windows system volume instead. |
 | `monitorcontrol is not installed...` | From the repository root, rerun `python -m pip install -e .`. |
 | Volume keys still change Windows audio | Restore the UI and wait for a successful volume read. If `Volume-key listener failed` appeared, the buttons/slider may work but global keys will not. |
@@ -304,8 +313,8 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | A volume press occurs during a display change | Notifications release interception immediately. If Windows did not notify before the first press, that press can be consumed while asynchronous validation rejects the monitor write; later presses pass through. |
 | The selected monitor is missing or ambiguous | The app will not choose another monitor. Reconnect it or explicitly select the intended target. |
 | The displayed value is stale | Choose **Refresh** after changes made by the monitor OSD or another tool. Display topology changes refresh automatically, but external volume is not polled. |
-| Selection is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Save errors are not surfaced. |
-| Change speed is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Invalid values safely fall back to Slow. |
+| Selection is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Save failures are retained in the diagnostic log. |
+| Change speed is not remembered | Ensure the per-user settings directory is writable and only one instance is running. Invalid values safely fall back to Slow; save failures are logged. |
 | Selection is lost after moving a no-serial monitor | Its Windows device path changed. Select it again so schema version 2 records the new path. |
 | Build fails before compilation | Install `.[build]`, ensure `python` resolves on `PATH`, and keep `app.py` and `windows-ddc.ico` at the repository root. |
 

@@ -9,12 +9,12 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, display invalidation, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
+- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, rotating diagnostics, display invalidation, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
 
 ## Runtime Shape
 
 1. `app.py` acquires the session-local `SingleInstanceGuard` before creating Tk. A duplicate broadcasts restore and exits before application initialization.
-2. The primary creates the single `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters Tk's main loop while retaining the mutex handle.
+2. The primary configures the rotating diagnostic log, creates the single `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters Tk's main loop while retaining the mutex handle.
 3. `display-change-listener`, `tray-icon`, and `volume-key-hook` are long-lived daemon threads with native Win32 message loops.
 4. `ddc-gui-worker` and `ddc-volume-write` are short-lived daemon workers for blocking DDC/CI work.
 5. Worker and native-thread callbacks cross into Tk through `queue.Queue`; `_poll_queues()` drains them every 50 ms.
@@ -29,6 +29,7 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | File | Responsibility |
 | --- | --- |
 | `app.py` | Supported process entrypoint, single-instance boundary, and Tk composition root. |
+| `diagnostics.py` | Nonfatal per-user rotating-log configuration and component logger access. |
 | `main.py` | Unsupported launcher stub; prints migration guidance and returns `1`. |
 | `gui.py` | UI state machine, selection, readiness, queues, worker serialization, tray/window lifecycle. |
 | `ddc.py` | Monitor identity, enumeration, clamping, and DDC read/write wrappers. |
@@ -55,6 +56,7 @@ Changes to the icon name or location must update `theme.APP_ICON_PATH`, `--windo
 - Saving either monitor selection or Change speed writes `settings.tmp` and then replaces `settings.json` while preserving the other valid setting. There is backward-compatible loading/promotion for unambiguous legacy description/ordinal files and no file lock; the session mutex prevents ordinary same-session project instances from racing but does not coordinate external tools or separate sessions.
 - Missing, unreadable, invalid-JSON, non-object, unknown-version, and invalid nested monitor settings are treated as absent. JSON booleans are rejected as legacy ordinals. Missing or invalid Change speed defaults to `slow`; valid persisted values are `slow`, `medium`, and `fast`.
 - Do not read, overwrite, delete, or reset a user's live `settings.json` or leftover `settings.tmp` during automated work. Patch `settings.SETTINGS_PATH` to a unique temporary path before calling load/save functions.
+- Live diagnostics normally reside at `%LOCALAPPDATA%\windows-ddc\windows-ddc.log`, fall back to `APPDATA` and then home, and retain two 512 KiB backups. Do not read, overwrite, delete, or reset them during automated work; pass a unique temporary path to `configure_logging()` in tests.
 - The physical monitor volume is external mutable state. A set can succeed even if the following readback fails, and shutdown does not restore the old value.
 - No secrets are currently used or stored. Never add tokens, credentials, private endpoints, dumps, or machine-specific values to source, screenshots, fixtures, logs, or documentation.
 
@@ -87,6 +89,7 @@ CI is validation-only. Keep it free of `python app.py`, controller `start()` cal
 - `ddc.change_monitor_volume(monitor_ref, delta) -> int` (currently unused by the GUI)
 - `settings.load_selected_monitor_key()` and `settings.save_selected_monitor_key()`
 - `settings.load_change_speed()` and `settings.save_change_speed()`
+- `diagnostics.configure_logging()`, `get_logger()`, and `close_logging()`
 - `windows_platform.SingleInstanceGuard` and `request_existing_instance_restore()`
 - `windows_platform.DisplayChangeListener`, `TrayIconController`, and `GlobalVolumeKeyListener`
 
@@ -98,7 +101,7 @@ Run these low-risk validation checks from the repository root:
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall -q app.py ddc.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
+python -m compileall -q app.py ddc.py diagnostics.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
 python -m pip check
 git diff --check
 git diff --cached --check
@@ -152,6 +155,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Display/device notifications trigger debounced discovery with bounded retries; every actual write also reacquires monitor wrappers. Do not claim that external OSD/program volume changes are polled.
 - Preserve the acknowledged tray-show handshake: never withdraw Tk until the tray thread confirms `Shell_NotifyIconW` success. Tray errors must keep or restore the main window, and a `TaskbarCreated` broadcast must re-add an icon that was intended to be visible.
 - Preserve the session-local named mutex before Tk initialization and retain its handle through main-loop exit. Duplicate launch must not read settings or initialize hooks, tray state, or DDC workers; its restore broadcast is best-effort.
+- Configure logging only after acquiring the session mutex so duplicate processes never contend for rotation. Logging setup must remain nonfatal, bounded, and free of deliberate monitor identity or secret fields.
 - Do not bypass the guard to run multiple instances during testing. Separate sessions and external tools can still conflict over hardware or `settings.tmp` because there is no file or hardware lock.
 - Keep CI on Windows and hardware-free. Changes to its Python matrix, commands, permissions, or action versions must update `tests/test_ci_workflow.py`, README, and architecture documentation together.
 - Do not hand-edit or commit `dist/`, `windows_ddc.egg-info/`, or `__pycache__/`. The present egg-info is ignored generated residue and can be stale; `pyproject.toml` and tracked sources are authoritative.

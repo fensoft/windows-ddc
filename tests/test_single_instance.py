@@ -80,7 +80,12 @@ class CompositionRootTests(unittest.TestCase):
     def test_primary_instance_holds_guard_for_the_tk_lifetime(self) -> None:
         guard = Mock()
         root = Mock()
-        with patch("app.SingleInstanceGuard", return_value=guard), patch(
+        logger = Mock()
+        with patch("app.get_logger", return_value=logger), patch(
+            "app.configure_logging"
+        ) as configure_logging_mock, patch(
+            "app.close_logging"
+        ) as close_logging_mock, patch("app.SingleInstanceGuard", return_value=guard), patch(
             "app.tk.Tk",
             return_value=root,
         ) as tk_mock, patch("app.MonitorVolumeApp") as app_mock:
@@ -91,9 +96,15 @@ class CompositionRootTests(unittest.TestCase):
         app_mock.assert_called_once_with(root)
         root.mainloop.assert_called_once_with()
         guard.close.assert_called_once_with()
+        configure_logging_mock.assert_called_once_with()
+        close_logging_mock.assert_called_once_with()
 
     def test_duplicate_exits_before_tk_and_requests_existing_window(self) -> None:
-        with patch(
+        with patch("app.get_logger") as get_logger_mock, patch(
+            "app.configure_logging"
+        ) as configure_logging_mock, patch(
+            "app.close_logging"
+        ) as close_logging_mock, patch(
             "app.SingleInstanceGuard",
             side_effect=InstanceAlreadyRunningError("already running"),
         ), patch("app.request_existing_instance_restore") as restore_mock, patch(
@@ -104,11 +115,19 @@ class CompositionRootTests(unittest.TestCase):
         self.assertEqual(result, 0)
         restore_mock.assert_called_once_with()
         tk_mock.assert_not_called()
+        get_logger_mock.assert_not_called()
+        configure_logging_mock.assert_not_called()
+        close_logging_mock.assert_not_called()
 
     def test_guard_is_closed_when_app_construction_fails(self) -> None:
         guard = Mock()
         root = Mock()
-        with patch("app.SingleInstanceGuard", return_value=guard), patch(
+        logger = Mock()
+        with patch("app.get_logger", return_value=logger), patch(
+            "app.configure_logging"
+        ), patch(
+            "app.close_logging"
+        ) as close_logging_mock, patch("app.SingleInstanceGuard", return_value=guard), patch(
             "app.tk.Tk",
             return_value=root,
         ), patch("app.MonitorVolumeApp", side_effect=RuntimeError("startup failed")):
@@ -116,6 +135,8 @@ class CompositionRootTests(unittest.TestCase):
                 app.main()
 
         guard.close.assert_called_once_with()
+        logger.exception.assert_called_once_with("Unhandled application failure.")
+        close_logging_mock.assert_called_once_with()
 
 
 if __name__ == "__main__":

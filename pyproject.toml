@@ -20,6 +20,7 @@ build = [
 [tool.setuptools]
 py-modules = [
     "app",
+    "diagnostics",
     "gui",
     "ddc",
     "settings",

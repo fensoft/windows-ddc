@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 
+from diagnostics import close_logging, configure_logging, get_logger
 from gui import MonitorVolumeApp
 from windows_platform import (
     InstanceAlreadyRunningError,
@@ -21,12 +22,22 @@ def main() -> int:
             pass
         return 0
 
+    logger = get_logger(__name__)
     try:
+        configure_logging()
+        logger.info("Application start requested.")
         root = tk.Tk()
         MonitorVolumeApp(root)
         root.mainloop()
+    except Exception:
+        logger.exception("Unhandled application failure.")
+        raise
     finally:
-        instance_guard.close()
+        try:
+            logger.info("Application process exiting.")
+            close_logging()
+        finally:
+            instance_guard.close()
     return 0
 
 

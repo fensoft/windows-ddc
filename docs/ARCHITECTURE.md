@@ -7,7 +7,7 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 ## High-level flow
 
 1. The supported entrypoint, `app.py`, acquires a session-local named mutex. A duplicate broadcasts a restore request and exits before creating Tk or application subsystems.
-2. The primary instance creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()` while retaining the mutex handle.
+2. The primary instance configures a rotating per-user diagnostic log, creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()` while retaining the mutex handle.
 3. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference and loads the saved monitor selection and Change speed preference from `settings.py`.
 4. It builds the fixed-size control window, status bar, and hidden `overlay.VolumeOverlay` on the Tk thread.
 5. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
@@ -19,7 +19,7 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 11. The readback becomes authoritative. A coalesced follow-up starts another worker and therefore performs another fresh discovery/match.
 12. Display/device notifications invalidate a thread-safe topology generation immediately, release key consumption, clear pending writes, and schedule debounced discovery with bounded retries.
 13. A 10-second watchdog fails a stalled DDC operation closed without releasing its serialization slot; when the worker eventually returns, its result is ignored and read-only rediscovery follows.
-14. Shutdown disables key consumption, cancels Tk timers, stops display/hook/tray loops, reports missed stop deadlines, closes the overlay, destroys Tk, and releases the mutex handle.
+14. Shutdown disables key consumption, cancels Tk timers, stops display/hook/tray loops, reports missed stop deadlines, closes the overlay, destroys Tk, closes the diagnostic handler, and releases the mutex handle.
 
 ## Runtime process and thread ownership
 
@@ -27,7 +27,7 @@ Source execution uses one interactive process per Windows session, enforced by `
 
 | Thread | Lifetime | Owns or performs | Communication boundary |
 | --- | --- | --- | --- |
-| Tk main thread | Process lifetime | Widgets, state mutation, selection persistence, status, overlay, queue draining | Receives queued callables and key deltas every 50 ms |
+| Tk main thread | Process lifetime | Widgets, state mutation, selection persistence, status, overlay, queue draining, diagnostic-handler lifecycle | Receives queued callables and key deltas every 50 ms |
 | `display-change-listener` | Long-lived daemon | Hidden Win32 window, monitor device registration, `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` message pump | Invalidates the topology generation and enqueues Tk work |
 | `tray-icon` | Long-lived daemon | Hidden Win32 window, notification icon, native menu, message pump | Controller callbacks enqueue Tk work through `_post_to_ui()` |
 | `volume-key-hook` | Long-lived daemon | `WH_KEYBOARD_LL` hook and message pump | Reads readiness through `should_consume()` and enqueues integer deltas |
@@ -38,7 +38,7 @@ Source execution uses one interactive process per Windows session, enforced by `
 
 The `_busy` flag prevents a new refresh/selection worker while another general operation is active. Volume controls remain usable during a valid active volume write, but they update `_pending_target_volume` rather than starting another DDC worker. A token identifies the one application-issued DDC operation, and a Tk watchdog tracks it. A timeout disables controls and interception but deliberately retains the token and busy/write flags until the uncancellable worker returns. This is the application's serialization boundary; there is no separate DDC lock.
 
-Display, tray, and hook startup readiness waits and shutdown joins each have two-second deadlines. Stop methods report whether their native thread exited; shutdown writes missed deadlines or stop exceptions to standard error and the status bar before destroying Tk. DDC workers are daemon threads and are not cancelled or joined; `_closing` drops their eventual callbacks.
+Display, tray, and hook startup readiness waits and shutdown joins each have two-second deadlines. Stop methods report whether their native thread exited; shutdown writes missed deadlines or stop exceptions to the diagnostic log, standard error, and the status bar before destroying Tk. DDC workers are daemon threads and are not cancelled or joined; `_closing` drops their eventual callbacks.
 
 All Tk calls must remain on the Tk thread. A native or DDC thread must enqueue work rather than touching widgets. Queued callbacks must remain small and exception-safe even though the polling boundary now contains and reports their failures.
 
@@ -49,10 +49,10 @@ All Tk calls must remain on the Tk thread. A native or DDC thread must enqueue w
 `app.main()` is intentionally small:
 
 ```text
-SingleInstanceGuard -> tk.Tk -> MonitorVolumeApp -> Tk mainloop -> release guard
+SingleInstanceGuard -> configure logging -> tk.Tk -> MonitorVolumeApp -> Tk mainloop -> close logging -> release guard
 ```
 
-The guard is acquired before Tk and always closed in `finally`. `ERROR_ALREADY_EXISTS` makes a duplicate register and broadcast the restore message, then return `0` without reading settings or creating hooks, tray state, or DDC workers. Keeping composition here makes `gui.py` responsible for application behavior without creating a second root or hidden launcher layer. Both source execution and `build_exe.ps1` use `app.py` and therefore share the same mutex.
+The guard is acquired before logging or Tk and always closed in `finally`. This keeps a duplicate from opening the rotating log concurrently with the primary. `ERROR_ALREADY_EXISTS` makes the duplicate register and broadcast the restore message, then return `0` without reading settings or creating hooks, tray state, or DDC workers. Keeping composition here makes `gui.py` responsible for application behavior without creating a second root or hidden launcher layer. Both source execution and `build_exe.ps1` use `app.py` and therefore share the same mutex.
 
 ### Unsupported entrypoint: `main.py`
 
@@ -67,6 +67,7 @@ The guard is acquired before Tk and always closed in `finally`. `ERROR_ALREADY_E
 | Module | Responsibility |
 | --- | --- |
 | `app.py` | Enforces the single-instance boundary, then creates and runs the application. |
+| `diagnostics.py` | Configures and closes the bounded per-user rotating log and provides component loggers. |
 | `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, persistence calls, tray lifecycle, and shutdown. |
 | `ddc.py` | Defines `MonitorRef`, selection identity, monitor discovery, clamping, and DDC read/change/write wrappers. |
 | `settings.py` | Atomically loads and replaces the selected-monitor and Change speed JSON settings. |
@@ -224,7 +225,7 @@ The manually maintained screenshots are tracked at `docs/app.png` (452×203) and
 
 ## Persistent data and filesystem ownership
 
-The only intended durable application file is normally:
+The intended durable application files are the settings file and bounded diagnostic logs. The normal settings path is:
 
 ```text
 %APPDATA%\windows-ddc\settings.json
@@ -260,11 +261,13 @@ The monitor-selection writer emits schema version 2. Its loader accepts the old 
 
 The monitor's actual volume is external mutable hardware state, not app storage. The app reads it after discovery or selection and never backs it up or restores it on exit.
 
+`diagnostics.LOG_PATH` normally resolves to `%LOCALAPPDATA%\windows-ddc\windows-ddc.log`, falling back to `APPDATA` and then the home directory. `RotatingFileHandler` caps the current log at 512 KiB and retains two backups. Handler creation failure installs a managed `NullHandler`, so an unwritable diagnostic location never blocks application startup. Routine GUI messages log operation classes rather than monitor descriptions, identities, or device paths; unexpected top-level tracebacks can still contain local source paths.
+
 ### Backup and restore format
 
 Backup is a plain copy of `settings.json` while all instances are stopped. Restore is replacement with a UTF-8 JSON object matching the schema above. Moving the file aside resets saved selection and Change speed. There is no archive, database dump, encryption, integrity marker, or built-in backup command.
 
-Tests must replace `settings.SETTINGS_PATH` with a unique temporary path. They must not redirect or mutate a user's live app-data directory.
+Tests must replace `settings.SETTINGS_PATH` and diagnostic destinations with unique temporary paths. They must not read, redirect, mutate, or delete a user's live app-data files.
 
 ## Authentication and security boundaries
 
@@ -276,7 +279,7 @@ The security-relevant boundaries are local:
 2. **Physical hardware writes.** DDC/CI writes change monitor state and may produce an audible volume change. They are neither transactional nor rolled back.
 3. **Native ABI.** Incorrect ctypes structures, argument types, callback signatures, or callback lifetimes can corrupt or crash the process.
 4. **Cross-thread UI.** Tk is not thread-safe; queues are the required ownership boundary.
-5. **Per-user file.** Settings are user-writable and unencrypted, but contain only monitor identity metadata; a device-interface path is machine-specific but is not a credential.
+5. **Per-user files.** Settings and diagnostics are user-writable and unencrypted. Settings contain monitor identity metadata; routine diagnostics avoid it, although unexpected tracebacks can contain local paths. A device-interface path is machine-specific but is not a credential.
 
 Runtime code has no network path. Dependency installation and Nuitka's `--assume-yes-for-downloads` build can contact external package/toolchain servers; these are development/build effects, not application runtime behavior.
 
@@ -285,7 +288,7 @@ Runtime code has no network path. Dependency installation and Nuitka's `--assume
 `pyproject.toml` uses `setuptools.build_meta` as its PEP 517 backend, with unpinned `setuptools` and `wheel` build-system requirements. It declares project version `0.1.0`, Python `>=3.10`, and explicit flat modules:
 
 ```text
-app, gui, ddc, settings, theme, overlay, windows_platform
+app, diagnostics, gui, ddc, settings, theme, overlay, windows_platform
 ```
 
 The direct runtime dependency is pinned to `monitorcontrol==4.2.0`. The `build` extra pins `Nuitka==2.4.8`. There is no lockfile; build-system requirements and transitive build dependencies are not fully pinned.
@@ -319,14 +322,14 @@ There is likewise no web frontend/backend split, API request flow, database sche
 
 ## Health and failure behavior
 
-The status bar is the only normal health surface:
+The status bar is the immediate health surface:
 
 - startup begins at `Searching for monitors...`;
 - successful initial read reports Ready, monitor count, and selected description;
 - empty discovery reports `No DDC/CI monitors found.`;
 - monitor, hook, and tray exceptions are formatted into status text.
 
-The packaged executable disables its console, and no file logger exists. Tray failures therefore restore the main window so the status bar remains available as the diagnostic surface.
+The packaged executable disables its console. `diagnostics.py` retains lifecycle, thread/component, native-subsystem, settings-save, DDC watchdog, refresh/write, queued-callback, shutdown, and top-level failure records in a bounded per-user log. Tray failures still restore the main window so an immediate status remains visible.
 
 Volume-control readiness requires a live display listener, valid topology generation, unique selected identity, and confirmed volume. Key-consumption readiness additionally requires an active keyboard hook. Refresh clears readiness while it runs and restores it only after an exact match and successful read. Topology and write failures trigger bounded automatic rediscovery; external OSD/tool volume changes are not reconciled automatically.
 
@@ -337,11 +340,11 @@ Known failure-state caveats include:
 - if Windows emits no notification before a first post-change press, that press can be consumed while asynchronous revalidation rejects the write; subsequent presses pass through;
 - a set may succeed before its readback fails;
 - duplicate restoration is a best-effort broadcast and can be missed during the primary instance's very early startup or shutdown;
-- the packaged executable has no console or file logger, so shutdown diagnostics are primarily useful in source runs and may be visible only briefly in the status bar.
+- diagnostic-handler creation is deliberately nonfatal, so an unwritable log location leaves only the status bar (and standard error in source runs).
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, diagnostic writing/rotation/setup failure, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
 
 `.github/workflows/ci.yml` runs on `windows-latest` for pushes, pull requests, and manual dispatches with a Python 3.10/3.14 matrix. It installs the runtime project, runs the unit suite, compiles runtime modules, checks installed dependencies, parses `build_exe.ps1` without executing it, checks tracked/staged whitespace, and requires a clean repository state. It neither starts `app.py` nor invokes hardware tools, monitor enumeration, the Nuitka build, publishing, or deployment. `tests/test_ci_workflow.py` locks down that hardware-free contract.
 
@@ -359,7 +362,7 @@ An authorized manual Windows/hardware pass is required for changes to discovery,
 - Preserve system key pass-through until a selected monitor has a successful volume read, and clear/pass through safely on loss of readiness.
 - Keep native ctypes callbacks strongly referenced and stop display/hook/tray loops before destroying Tk.
 - Do not use the displayed index or description ordinal as current persistent identity. Preserve version-2 matching and backward-compatible legacy loading.
-- Never touch live per-user settings in automated work; use a temporary path.
+- Never touch live per-user settings or diagnostics in automated work; use temporary paths.
 - Treat physical monitor volume and global keyboard handling as safety-sensitive side effects.
 - Keep `[tool.setuptools].py-modules` synchronized when distributable runtime modules are added, renamed, or removed.
 - Keep `windows-ddc.ico`, `theme.APP_ICON_PATH`, and both Nuitka icon flags synchronized.

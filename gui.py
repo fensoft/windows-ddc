@@ -19,6 +19,7 @@ from ddc import (
     read_monitor_volume,
     set_monitor_volume,
 )
+from diagnostics import get_logger
 from overlay import VolumeOverlay
 from settings import (
     DEFAULT_CHANGE_SPEED,
@@ -39,6 +40,7 @@ from windows_platform import DisplayChangeListener, GlobalVolumeKeyListener, Tra
 
 RefreshResult: TypeAlias = tuple[list[MonitorRef], SelectionMatch, int | None, Exception | None]
 WriteResult: TypeAlias = tuple[list[MonitorRef], int, int, SavedMonitorSelection]
+LOGGER = get_logger(__name__)
 
 
 class MonitorSelectionUnavailable(RuntimeError):
@@ -243,6 +245,10 @@ class MonitorVolumeApp:
         try:
             self._display_listener.start()
         except Exception as exc:
+            LOGGER.error(
+                "Display-change listener startup failed (%s).",
+                exc.__class__.__name__,
+            )
             self._display_listener = None
             self._topology_valid.clear()
             self._control_unavailable_reason = "Display-change protection is unavailable."
@@ -259,6 +265,7 @@ class MonitorVolumeApp:
             )
             self._tray_icon.start()
         except Exception as exc:
+            LOGGER.error("Tray icon startup failed (%s).", exc.__class__.__name__)
             self._tray_icon = None
             error_message = self._format_error(exc).rstrip(".")
             self._set_status(f"Tray icon failed: {error_message}. The main window will remain available.")
@@ -280,6 +287,7 @@ class MonitorVolumeApp:
         try:
             self._listener.start()
         except Exception as exc:
+            LOGGER.error("Volume-key listener startup failed (%s).", exc.__class__.__name__)
             self._listener = None
             self._set_status(self._format_error(exc))
 
@@ -295,8 +303,8 @@ class MonitorVolumeApp:
             self._listener.set_step(self.volume_step)
         try:
             save_change_speed(selected_speed)
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("Saving Change speed failed (%s).", exc.__class__.__name__)
 
     def _handle_display_change_from_thread(self) -> None:
         self._invalidate_topology_generation()
@@ -307,6 +315,7 @@ class MonitorVolumeApp:
         self._post_to_ui(lambda error=exc: self._handle_display_listener_error(error))
 
     def _handle_display_listener_error(self, exc: Exception) -> None:
+        LOGGER.error("Display-change listener failed (%s).", exc.__class__.__name__)
         self._hotkeys_ready = False
         self.current_volume = None
         self.target_volume = None
@@ -338,6 +347,7 @@ class MonitorVolumeApp:
         self._post_to_ui(lambda error=exc: self._handle_listener_error(error))
 
     def _handle_listener_error(self, exc: Exception) -> None:
+        LOGGER.error("Volume-key listener failed (%s).", exc.__class__.__name__)
         self._hotkeys_ready = False
         self._update_hotkey_state()
         self._set_status(f"Volume-key listener failed: {self._format_error(exc)}")
@@ -348,6 +358,7 @@ class MonitorVolumeApp:
     def _handle_tray_error(self, exc: Exception) -> None:
         if self._closing:
             return
+        LOGGER.error("Tray icon failed (%s).", exc.__class__.__name__)
         self._in_tray = False
         if self._tray_icon is not None:
             self._tray_icon.hide()
@@ -450,6 +461,7 @@ class MonitorVolumeApp:
                     self._poll_after_id = None
 
     def _report_ui_callback_error(self, exc: Exception) -> None:
+        LOGGER.error("Tk queue callback failed (%s).", exc.__class__.__name__)
         message = f"Internal UI callback failed: {self._format_error(exc)}"
         try:
             self._topology_valid.clear()
@@ -525,8 +537,8 @@ class MonitorVolumeApp:
             return
         try:
             save_selected_monitor_key(selection)
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("Saving the selected monitor failed (%s).", exc.__class__.__name__)
 
     def _set_displayed_volume(self, volume: int | None) -> None:
         self._ignore_scale_events = True
@@ -668,6 +680,7 @@ class MonitorVolumeApp:
             return
 
         operation_kind = self._active_ddc_operation_kind or "DDC"
+        LOGGER.error("%s operation exceeded the watchdog deadline.", operation_kind)
         self._ddc_timeout_after_id = None
         self._ddc_operation_timed_out = True
         self._invalidate_topology_generation()
@@ -817,6 +830,8 @@ class MonitorVolumeApp:
             return
 
         if volume_error is not None or volume is None:
+            failure = volume_error or RuntimeError("Monitor volume is unavailable.")
+            LOGGER.warning("Selected-monitor volume read failed (%s).", failure.__class__.__name__)
             self.selected_key = selection
             self.current_volume = None
             self.target_volume = None
@@ -824,7 +839,7 @@ class MonitorVolumeApp:
             self._topology_valid.clear()
             self._update_hotkey_state()
             self._set_displayed_volume(None)
-            reason = self._format_error(volume_error or RuntimeError("Monitor volume is unavailable."))
+            reason = self._format_error(failure)
             self._control_unavailable_reason = reason
             self._set_status(reason)
             self._apply_control_state()
@@ -873,6 +888,7 @@ class MonitorVolumeApp:
         if not self._is_topology_generation_current(generation):
             self._schedule_refresh(self.DISPLAY_CHANGE_DEBOUNCE_MS, automatic=True)
             return
+        LOGGER.error("Monitor refresh failed (%s).", exc.__class__.__name__)
         self.monitors = []
         self.monitor_combo["values"] = ()
         self.monitor_var.set("")
@@ -1035,6 +1051,7 @@ class MonitorVolumeApp:
         if not self._accept_ddc_completion(operation_id):
             return
 
+        LOGGER.error("Monitor volume write failed (%s).", exc.__class__.__name__)
         if isinstance(exc, MonitorSelectionUnavailable) and exc.monitors is not None:
             self._update_monitor_list(exc.monitors, None)
         self._volume_write_inflight = False
@@ -1174,6 +1191,7 @@ class MonitorVolumeApp:
             self._tray_icon = None
         if shutdown_failures:
             message = "Shutdown warning: " + "; ".join(shutdown_failures)
+            LOGGER.error("Native controller shutdown did not complete cleanly.")
             print(message, file=sys.stderr)
             try:
                 self._set_status(message)

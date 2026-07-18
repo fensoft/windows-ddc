@@ -42,7 +42,7 @@ jobs:
       - name: Compile runtime modules
         run: >-
           python -m compileall -q
-          app.py ddc.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
+          app.py ddc.py diagnostics.py gui.py main.py overlay.py settings.py theme.py windows_platform.py
 
       - name: Check installed dependencies
         run: python -m pip check

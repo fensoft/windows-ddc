@@ -32,6 +32,7 @@ class CIWorkflowTests(unittest.TestCase):
         for command in expected_commands:
             with self.subTest(command=command):
                 self.assertIn(command, self.workflow)
+        self.assertIn("diagnostics.py", self.workflow)
 
     def test_workflow_never_launches_the_app_or_hardware_tools(self) -> None:
         forbidden_commands = (
