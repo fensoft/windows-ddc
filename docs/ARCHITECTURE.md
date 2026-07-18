@@ -178,7 +178,7 @@ There is no user preference to disable the hook while leaving the app running. D
 
 ## Tray and window event flow
 
-`TrayIconController` creates a per-process hidden Win32 window named with the process ID and controller identity. Its message loop handles private show/hide/exit messages, `Shell_NotifyIconW` callbacks, and a native popup menu.
+`TrayIconController` creates a per-process hidden Win32 window named with the process ID and controller identity. Its message loop handles private show/hide/exit messages, the registered `TaskbarCreated` broadcast, `Shell_NotifyIconW` callbacks, and a native popup menu.
 
 - Icon ID: `1`
 - Tooltip: `windows-ddc`
@@ -187,7 +187,9 @@ There is no user preference to disable the hook while leaving the app running. D
 
 The controller tries to load `windows-ddc.ico` at the Windows small-icon dimensions and falls back to `IDI_APPLICATION`. The main Tk window also tries the same tracked icon; icon failure is nonfatal.
 
-The tray's native window is created synchronously from the caller's perspective because `start()` waits for `_ready`. Adding the visible notification icon is asynchronous: `show()` posts a native message and `MonitorVolumeApp.minimize_to_tray()` immediately withdraws Tk. If icon addition fails afterward, its error is posted to the now-hidden status bar and the window can become unreachable. Taskbar/Explorer recreation through `TaskbarCreated` is not handled, so a lost icon is not automatically restored.
+The tray's native window is created synchronously from the caller's perspective because `start()` waits for `_ready`. `show()` creates a per-request completion event, posts `WM_TRAY_SHOW`, and waits up to two seconds for the tray thread's actual `Shell_NotifyIconW` result. `MonitorVolumeApp.minimize_to_tray()` withdraws Tk only after that acknowledgement. A native failure, stopped controller, post failure, or timeout keeps/restores and normalizes the main window, hides any late icon best-effort, and reports the error in the visible status bar.
+
+The controller registers the shell's `TaskbarCreated` message during construction. When Explorer recreates the taskbar, a previously visible icon is re-added with `NIM_ADD` and its notification version is restored. If re-registration fails, the error crosses the queue boundary and Tk restores the main window instead of leaving the process unreachable.
 
 Minimizing a visible Tk window schedules an idle check and withdraws it only if the state is `iconic`. Restoring hides the tray icon, normalizes/lifts/focuses the Tk window, and reapplies dark title-bar chrome. Closing the visible window follows the full shutdown path rather than minimizing.
 
@@ -318,7 +320,7 @@ The status bar is the only normal health surface:
 - empty discovery reports `No DDC/CI monitors found.`;
 - monitor, hook, and tray exceptions are formatted into status text.
 
-The packaged executable disables its console, and no file logger exists. If the main window is withdrawn, a tray failure can also hide the only error surface.
+The packaged executable disables its console, and no file logger exists. Tray failures therefore restore the main window so the status bar remains available as the diagnostic surface.
 
 Volume-control readiness requires a live display listener, valid topology generation, unique selected identity, and confirmed volume. Key-consumption readiness additionally requires an active keyboard hook. Refresh clears readiness while it runs and restores it only after an exact match and successful read. Topology and write failures trigger bounded automatic rediscovery; external OSD/tool volume changes are not reconciled automatically.
 
@@ -326,14 +328,13 @@ Known failure-state caveats include:
 
 - an in-flight native DDC call cannot be cancelled, so a topology event can race with the final pre-write generation check;
 - if Windows emits no notification before a first post-change press, that press can be consumed while asynchronous revalidation rejects the write; subsequent presses pass through;
-- tray/icon loss can strand a withdrawn main window;
 - `start()` waits on native readiness events without a timeout;
 - a set may succeed before its readback fails;
 - an exception in a queued Tk callback can stop recurring queue polling.
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, topology generations, display-message routing, and fresh-wrapper writes. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, topology generations, display-message routing, fresh-wrapper writes, acknowledged tray addition, visible-window fallback, and Explorer restart recovery. It has no third-party test framework, linter, formatter, type checker, or CI workflow. Low-risk validation also includes Python compilation, dependency checks, PowerShell parsing, diff whitespace checks, and status review.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 

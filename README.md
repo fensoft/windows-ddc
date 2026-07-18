@@ -23,7 +23,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 - Provides a slider and `-`/`+` buttons with selectable `+1`, `+2`, or `+3` steps.
 - Intercepts the global Windows Volume Down and Volume Up keys only while the native hook is live and a target is ready.
 - Shows volume and fail-closed monitor errors in a bottom-centered, best-effort topmost overlay.
-- Starts in the Windows notification area, with Restore and Exit actions.
+- Starts in the Windows notification area only after Windows confirms the icon was added, with Restore and Exit actions plus Explorer-restart recovery.
 - Remembers the selected physical monitor by EDID manufacturer/product/serial when available, with a Windows device-path fallback.
 - Invalidates monitor control on Windows display/device notifications and reacquires fresh DDC handles before every actual write.
 - Follows the current user's Windows light/dark application preference at startup.
@@ -87,7 +87,7 @@ and exits with status `1`. `windows-ddc` itself defines no console entry point o
 
 1. Enable DDC/CI in the monitor's on-screen settings before starting the application.
 2. Start `windows-ddc.exe` or run `python app.py`.
-3. Look in the notification area, including its overflow menu. A successful tray initialization hides the control window immediately.
+3. Look in the notification area, including its overflow menu. The control window hides only after Windows confirms that the tray icon was added; otherwise it remains available with an error in the status bar.
 4. Double-click the tray icon, or right-click it and choose **Restore**.
 5. Choose the intended monitor and wait for the status bar to report a successful volume read.
 6. Test at a safe listening level with the buttons or slider before relying on the global volume keys.
@@ -98,12 +98,12 @@ With no saved selection, the app selects automatically only when exactly one ver
 
 | Action | Behavior |
 | --- | --- |
-| Start | Creates display-change, tray, and keyboard-hook threads, hides in the notification area when the tray is available, then discovers monitors in the background. |
+| Start | Creates display-change, tray, and keyboard-hook threads, waits up to two seconds for confirmed tray-icon addition before hiding, then discovers monitors in the background. |
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
 | Change volume | Choose a `+1`, `+2`, or `+3` step, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
 | Refresh | Re-enumerates monitors and reads the exact saved selection again. It never falls back to a different monitor. |
-| Minimize | Sends the control window back to the notification area. |
+| Minimize | Sends the control window to the notification area only after confirmed icon addition; failure restores the normal window. |
 | Close the restored window | Exits the application; it does not merely hide the window. |
 | Exit from the tray | Removes the hook and tray icon, closes the overlay, and exits. |
 
@@ -127,9 +127,9 @@ There is no separate health command, readiness endpoint, log file, or console in
 | `Display configuration changed...` | Control was disabled immediately and automatic revalidation is pending. |
 | `Selected monitor ... ambiguous/not found` | No substitute target was chosen; select the monitor again or reconnect it. |
 | `Display-change listener failed: ...` | All monitor-volume writes are disabled because reset protection is unavailable. |
+| `Tray icon failed: ...` | Tray initialization, addition, or recovery failed; the main window remains visible or is restored. |
 | A read/write/detection error | The underlying operation failed; the status contains the formatted exception text. |
 | `Volume-key listener failed: ...` | The global hook failed. The GUI may still control the monitor. |
-| `Tray icon failed: ...` | A native notification-area operation failed. |
 
 Volume controls remain disabled until the display-change listener is live and the exact selected monitor has a readable volume. Global key interception additionally requires the keyboard listener to be installed and live. During an unavailable period, physical Volume Down/Up presses pass through to Windows and the app shows one error overlay per period. If the keyboard hook fails, the GUI can continue controlling the monitor; if display-change protection fails, all writes remain disabled.
 
@@ -247,7 +247,7 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated settings, topology generations, and fresh-handle revalidation. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated settings, topology generations, fresh-handle revalidation, and tray recovery. It has no lint/type/format configuration or CI workflow. The following safe checks avoid launching the UI, installing native listeners, or contacting monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -271,7 +271,7 @@ $parseErrors = $null
 if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 ```
 
-Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify unique/no-serial/duplicate identity behavior, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, minimize/restore, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
+Changes to GUI, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify unique/no-serial/duplicate identity behavior, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change physical monitor volume and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 
@@ -280,7 +280,7 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | Symptom | What to check |
 | --- | --- |
 | No window appears | Check the notification area and its overflow menu, then double-click the icon or choose **Restore**. Tray-first startup is expected. |
-| The process runs but no tray icon/window is reachable | Exit it with Task Manager and relaunch. Tray addition is asynchronous, so a native tray failure can occur after the main window has been hidden. |
+| The tray icon cannot be added or disappears | The main window remains visible or is restored automatically. After Explorer restarts, the app re-adds an icon that was visible; if recovery fails, read the restored window's status bar. |
 | `No DDC/CI monitors found.` | Enable DDC/CI in the monitor OSD, confirm the monitor exposes DDC/CI over the active connection, then choose **Refresh**. |
 | A monitor is listed but volume remains `--` | Enumeration succeeded but its volume read did not. Read the status, try another monitor, and confirm the target supports DDC/CI audio volume. |
 | `Display-change listener failed` | Monitor writes intentionally remain disabled because the app cannot provide reset protection. Restart the app; if it repeats, use Windows system volume instead. |

@@ -9,7 +9,7 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, display invalidation, and fresh-handle revalidation. There is no lint, format, type-check, third-party test-framework, or CI configuration. State that limitation accurately.
+- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, display invalidation, fresh-handle revalidation, and tray recovery. There is no lint, format, type-check, third-party test-framework, or CI configuration. State that limitation accurately.
 
 ## Runtime Shape
 
@@ -20,7 +20,7 @@ These instructions apply to the entire repository. Keep this file operational an
 5. Worker and native-thread callbacks cross into Tk through `queue.Queue`; `_poll_queues()` drains them every 50 ms.
 6. Only one application-issued DDC operation should be active. Rapid writes are serialized and reduced to the latest `_pending_target_volume`.
 7. A successful exact-identity volume read enables monitor control only while the display-change listener remains live and the topology generation is valid. If the native keyboard hook is also live, Volume Down/Up events are consumed instead of reaching Windows system audio.
-8. A successful tray initialization makes startup tray-first. Closing the restored window exits; minimizing returns it to the tray.
+8. Confirmed tray-icon addition makes startup tray-first. Addition or recovery failure keeps/restores the main window; Explorer recreation re-adds a previously visible icon. Closing the restored window exits, while minimizing returns it to the tray after another confirmed add.
 
 Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or DDC worker threads; enqueue a callback with `_post_to_ui()`.
 
@@ -36,7 +36,7 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `overlay.py` | Topmost, auto-hiding volume `Toplevel`. |
 | `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
 | `windows_platform.py` | Win32 ctypes ABI, monitor identity/EDID inventory, display notifications, tray controller, global keyboard hook, and DWM helpers. |
-| `tests/` | Hardware-free hotkey, identity, settings, topology-generation, and fresh-write regressions. |
+| `tests/` | Hardware-free hotkey, identity, settings, topology-generation, fresh-write, and tray-recovery regressions. |
 | `pyproject.toml` | Python requirement, dependency pins, and installed flat modules. |
 | `build_exe.ps1` | One-file Nuitka build for `dist\windows-ddc.exe`. |
 | `windows-ddc.ico` | Tracked executable, window, and tray icon source. |
@@ -125,6 +125,7 @@ GUI, tray, hook, theme, or DDC changes require an authorized Windows/manual pass
 - rapid-write coalescing and `0`/`100` boundaries;
 - overlay visibility and auto-hide;
 - minimize, restore, Refresh, and clean shutdown;
+- confirmed icon addition, failed-add fallback, and Explorer `TaskbarCreated` recovery;
 - disconnect/stale-handle behavior without leaving keys unexpectedly consumed.
 
 Manual DDC tests can be audible and mutate monitor state. Record what was actually exercised; do not imply hardware or OS coverage that was not run.
@@ -141,7 +142,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Do not treat a topology generation check as cancellation. A native DDC call already in progress can still mutate hardware; stale completions must remain non-authoritative and trigger read-only rediscovery.
 - Do not assume a listed monitor supports volume. Enumeration precedes the selected monitor's volume read.
 - Display/device notifications trigger debounced discovery with bounded retries; every actual write also reacquires monitor wrappers. Do not claim that external OSD/program volume changes are polled.
-- Do not ignore tray failure paths. Tray addition is asynchronous and a withdrawn Tk window can become unreachable if the icon is lost; Explorer `TaskbarCreated` recovery is not implemented.
+- Preserve the acknowledged tray-show handshake: never withdraw Tk until the tray thread confirms `Shell_NotifyIconW` success. Tray errors must keep or restore the main window, and a `TaskbarCreated` broadcast must re-add an icon that was intended to be visible.
 - Do not run multiple instances during testing. There is no mutex; hooks, tray icons, DDC traffic, and `settings.tmp` can conflict.
 - Do not hand-edit or commit `dist/`, `windows_ddc.egg-info/`, or `__pycache__/`. The present egg-info is ignored generated residue and can be stale; `pyproject.toml` and tracked sources are authoritative.
 - Review `docs/app.png` and `docs/overlay.png` when visible UI changes. Update them only with real application captures and scrub machine-specific or sensitive content.

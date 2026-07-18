@@ -303,6 +303,8 @@ user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wintypes.UINT
 user32.EnumDisplayMonitors.argtypes = [
     wintypes.HDC,
     ctypes.POINTER(wintypes.RECT),
@@ -784,10 +786,17 @@ class DisplayChangeListener:
         return user32.DefWindowProcW(hwnd, msg, w_param, l_param)
 
 
+class _TrayShowRequest:
+    def __init__(self) -> None:
+        self.completed = threading.Event()
+        self.error: Exception | None = None
+
+
 class TrayIconController:
     ICON_ID = 1
     MENU_RESTORE = 1001
     MENU_EXIT = 1002
+    SHOW_TIMEOUT_SECONDS = 2.0
 
     def __init__(
         self,
@@ -805,6 +814,9 @@ class TrayIconController:
         self._instance = kernel32.GetModuleHandleW(None)
         self._class_name = f"MonitorVolumeTrayWindow_{os.getpid()}_{id(self)}"
         self._wndproc = WNDPROC(self._window_proc)
+        self._taskbar_created_message = user32.RegisterWindowMessageW("TaskbarCreated")
+        if not self._taskbar_created_message:
+            raise PlatformError("Failed to register the TaskbarCreated message.")
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._message_loop, name="tray-icon", daemon=True)
         self._start_error: Exception | None = None
@@ -812,6 +824,9 @@ class TrayIconController:
         self._icon_visible = False
         self._icon_handle: HICON | None = None
         self._owns_icon_handle = False
+        self._show_requests_lock = threading.Lock()
+        self._show_requests: dict[int, _TrayShowRequest] = {}
+        self._next_show_request_id = 1
 
     @property
     def is_visible(self) -> bool:
@@ -825,9 +840,35 @@ class TrayIconController:
         if self._hwnd is None:
             raise PlatformError("Failed to initialize tray icon.")
 
-    def show(self) -> None:
-        if self._hwnd is not None:
-            user32.PostMessageW(self._hwnd, WM_TRAY_SHOW, 0, 0)
+    def show(self, timeout: float = SHOW_TIMEOUT_SECONDS) -> None:
+        if timeout <= 0:
+            raise ValueError("Tray show timeout must be positive.")
+
+        hwnd = self._hwnd
+        if hwnd is None:
+            raise PlatformError("Tray controller is not running.")
+
+        request = _TrayShowRequest()
+        with self._show_requests_lock:
+            request_id = self._next_show_request_id
+            self._next_show_request_id += 1
+            self._show_requests[request_id] = request
+
+        if not user32.PostMessageW(hwnd, WM_TRAY_SHOW, request_id, 0):
+            with self._show_requests_lock:
+                self._show_requests.pop(request_id, None)
+            error = win_error("Failed to request tray icon visibility")
+            raise PlatformError(f"Failed to show tray icon: {error}") from error
+
+        if not request.completed.wait(timeout):
+            with self._show_requests_lock:
+                self._show_requests.pop(request_id, None)
+            raise PlatformError("Timed out waiting for Windows to show the tray icon.")
+
+        with self._show_requests_lock:
+            self._show_requests.pop(request_id, None)
+        if request.error is not None:
+            raise PlatformError(f"Failed to show tray icon: {request.error}") from request.error
 
     def hide(self) -> None:
         if self._hwnd is not None:
@@ -893,13 +934,23 @@ class TrayIconController:
             user32.DispatchMessageW(ctypes.byref(message))
 
         self._hwnd = None
+        self._fail_show_requests(PlatformError("Tray controller stopped before showing the icon."))
         if class_registered:
             user32.UnregisterClassW(self._class_name, self._instance)
         self._release_icon_handle()
 
     def _window_proc(self, hwnd: wintypes.HWND, msg: int, w_param: int, l_param: int) -> int:
+        if msg == self._taskbar_created_message:
+            should_restore_icon = self._icon_visible
+            self._icon_visible = False
+            if should_restore_icon:
+                error = self._show_icon(hwnd)
+                if error is not None:
+                    self.on_error(error)
+            return 0
         if msg == WM_TRAY_SHOW:
-            self._show_icon(hwnd)
+            error = self._show_icon(hwnd)
+            self._complete_show_request(int(w_param), error)
             return 0
         if msg == WM_TRAY_HIDE:
             self._hide_icon(hwnd)
@@ -965,15 +1016,29 @@ class TrayIconController:
         self._icon_handle = None
         self._owns_icon_handle = False
 
-    def _show_icon(self, hwnd: wintypes.HWND) -> None:
+    def _complete_show_request(self, request_id: int, error: Exception | None) -> None:
+        with self._show_requests_lock:
+            request = self._show_requests.get(request_id)
+            if request is None:
+                return
+            request.error = error
+            request.completed.set()
+
+    def _fail_show_requests(self, error: Exception) -> None:
+        with self._show_requests_lock:
+            for request in self._show_requests.values():
+                request.error = error
+                request.completed.set()
+
+    def _show_icon(self, hwnd: wintypes.HWND) -> Exception | None:
         notify_data = self._make_notify_icon_data(hwnd)
         message = NIM_MODIFY if self._icon_visible else NIM_ADD
         if not shell32.Shell_NotifyIconW(message, ctypes.byref(notify_data)):
-            self.on_error(win_error("Shell_NotifyIconW failed"))
-            return
+            return win_error("Shell_NotifyIconW failed")
         if message == NIM_ADD:
             shell32.Shell_NotifyIconW(NIM_SETVERSION, ctypes.byref(notify_data))
         self._icon_visible = True
+        return None
 
     def _hide_icon(self, hwnd: wintypes.HWND) -> None:
         if not self._icon_visible:

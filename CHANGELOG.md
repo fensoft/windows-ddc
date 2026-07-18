@@ -12,6 +12,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Added hardware-free unit coverage for hook liveness, readiness loss, write failures, shutdown, and paired volume-key events.
 - Added EDID/device-path monitor identity, display/device change notifications, error overlays, and hardware-free identity/settings/revalidation coverage.
 - Added a `+1`/`+2`/`+3` volume-step selector for the GUI buttons and global volume keys.
+- Added hardware-free tray acknowledgement, fallback, timeout, and Explorer-restart recovery coverage.
 
 ### Changed
 
@@ -20,6 +21,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Kept the consume/pass-through decision stable from the first key-down through the matching key-up.
 - Replaced description/ordinal persistence with backward-compatible schema-version-2 stable identity matching; missing or ambiguous targets now fail closed instead of selecting another monitor.
 - Reacquire and exact-match fresh monitor wrappers before every actual DDC write, reject stale topology generations, and automatically rediscover after display changes or uncertain writes.
+- Wait for confirmed tray-icon addition before withdrawing Tk, restore the main window on tray failures, and re-add visible icons after Explorer recreates the taskbar.
 
 ## [0.1.0] - 2026-03-22
 

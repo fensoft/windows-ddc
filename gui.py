@@ -221,18 +221,19 @@ class MonitorVolumeApp:
             self._set_status(f"Display-change listener failed: {self._format_error(exc)}")
 
     def _start_tray_icon(self) -> None:
-        self._tray_icon = TrayIconController(
-            tooltip=self.TRAY_TOOLTIP,
-            on_restore=lambda: self._post_to_ui(self.restore_from_tray),
-            on_exit=lambda: self._post_to_ui(self.on_close),
-            on_error=self._handle_tray_error_from_thread,
-            icon_path=self.app_icon_path,
-        )
         try:
+            self._tray_icon = TrayIconController(
+                tooltip=self.TRAY_TOOLTIP,
+                on_restore=lambda: self._post_to_ui(self.restore_from_tray),
+                on_exit=lambda: self._post_to_ui(self.on_close),
+                on_error=self._handle_tray_error_from_thread,
+                icon_path=self.app_icon_path,
+            )
             self._tray_icon.start()
         except Exception as exc:
             self._tray_icon = None
-            self._set_status(self._format_error(exc))
+            error_message = self._format_error(exc).rstrip(".")
+            self._set_status(f"Tray icon failed: {error_message}. The main window will remain available.")
 
     def _start_minimized(self) -> None:
         if self._tray_icon is None:
@@ -315,7 +316,14 @@ class MonitorVolumeApp:
         self._post_to_ui(lambda error=exc: self._handle_tray_error(error))
 
     def _handle_tray_error(self, exc: Exception) -> None:
-        self._set_status(f"Tray icon failed: {self._format_error(exc)}")
+        if self._closing:
+            return
+        self._in_tray = False
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        self._show_main_window()
+        error_message = self._format_error(exc).rstrip(".")
+        self._set_status(f"Tray icon failed: {error_message}. The main window was restored.")
 
     def _invalidate_topology_generation(self) -> None:
         self._topology_valid.clear()
@@ -916,9 +924,20 @@ class MonitorVolumeApp:
     def minimize_to_tray(self) -> None:
         if self._closing or self._in_tray or self._tray_icon is None:
             return
-        self._tray_icon.show()
+        try:
+            self._tray_icon.show()
+        except Exception as exc:
+            self._handle_tray_error(exc)
+            return
         self._in_tray = True
         self.root.withdraw()
+
+    def _show_main_window(self) -> None:
+        self.root.deiconify()
+        self.root.state("normal")
+        apply_window_chrome(self.root, self.dark_mode)
+        self.root.lift()
+        self.root.focus_force()
 
     def restore_from_tray(self) -> None:
         if self._closing or not self._in_tray:
@@ -926,11 +945,7 @@ class MonitorVolumeApp:
         self._in_tray = False
         if self._tray_icon is not None:
             self._tray_icon.hide()
-        self.root.deiconify()
-        self.root.state("normal")
-        apply_window_chrome(self.root, self.dark_mode)
-        self.root.lift()
-        self.root.focus_force()
+        self._show_main_window()
 
     def on_window_unmap(self, _event: Any = None) -> None:
         if self._closing or self._in_tray or self._tray_icon is None:
