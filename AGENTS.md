@@ -20,7 +20,7 @@ These instructions apply to the entire repository. Keep this file operational an
 5. Worker and native-thread callbacks cross into Tk through `queue.Queue`; `_poll_queues()` drains them every 50 ms.
 6. Only one application-issued DDC operation should be active. Rapid writes are serialized and reduced to the latest `_pending_target_volume`. A timed-out operation keeps the slot until its worker returns; its late result is ignored and followed by read-only rediscovery.
 7. A successful exact-identity volume read enables monitor control only while the display-change listener remains live and the topology generation is valid. If the native keyboard hook is also live, Volume Down/Up events are consumed instead of reaching Windows system audio.
-8. Confirmed tray-icon addition makes startup tray-first. Addition or recovery failure keeps/restores the main window; Explorer recreation re-adds a previously visible icon. Closing the restored window exits, while minimizing returns it to the tray after another confirmed add.
+8. Confirmed tray-icon addition makes startup tray-first. Tk publishes immutable active-monitor, confirmed-volume, routing, and selectable-monitor snapshots; tray actions queue back into Tk. Addition or recovery failure keeps/restores the main window; Explorer recreation re-adds a previously visible icon. Closing the restored window exits, while minimizing returns it to the tray after another confirmed add.
 
 Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or DDC worker threads; enqueue a callback with `_post_to_ui()`.
 
@@ -32,12 +32,12 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `autostart.py` | Current-user Run-key state and quoted source/packaged launch commands. |
 | `diagnostics.py` | Nonfatal per-user rotating-log configuration and component logger access. |
 | `main.py` | Unsupported launcher stub; prints migration guidance and returns `1`. |
-| `gui.py` | UI state machine, selection, readiness, queues, worker serialization, tray/window lifecycle. |
+| `gui.py` | UI state machine, selection, readiness, queues, worker serialization, tray snapshots/actions, and window lifecycle. |
 | `ddc.py` | Monitor identity, enumeration, clamping, and DDC read/write wrappers. |
 | `settings.py` | Per-user selected-monitor and Change speed JSON load/save. |
 | `overlay.py` | Topmost, auto-hiding volume `Toplevel`. |
 | `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
-| `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display notifications, tray controller, global keyboard hook, and DWM helpers. |
+| `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display notifications, snapshot-driven tray controller, global keyboard hook, and DWM helpers. |
 | `tests/` | Hardware-free hotkey, identity, settings, autostart, single-instance, topology-generation, fresh-write, resilience, and tray-recovery regressions. |
 | `.github/workflows/ci.yml` | Windows Python 3.10/3.14 hardware-free unit and low-risk validation workflow. |
 | `pyproject.toml` | Python requirement, dependency pins, and installed flat modules. |
@@ -94,7 +94,7 @@ CI is validation-only. Keep it free of `python app.py`, controller `start()` cal
 - `diagnostics.configure_logging()`, `get_logger()`, and `close_logging()`
 - `autostart.is_start_with_windows_enabled()` and `set_start_with_windows()`
 - `windows_platform.SingleInstanceGuard` and `request_existing_instance_restore()`
-- `windows_platform.DisplayChangeListener`, `TrayIconController`, and `GlobalVolumeKeyListener`
+- `windows_platform.DisplayChangeListener`, `TrayIconController`, `TrayMenuState`, and `GlobalVolumeKeyListener`
 
 Keep each per-monitor DDC get/set sequence inside `with monitor_ref.monitor:`. Enumeration remains through `get_monitors()`, and description lookup remains on the wrapper. Preserve `0`–`100` application clamping and treat the post-write readback as authoritative when it succeeds.
 
@@ -140,6 +140,7 @@ GUI, tray, hook, theme, or DDC changes require an authorized Windows/manual pass
 - overlay visibility and auto-hide;
 - minimize, restore, Refresh, and clean shutdown;
 - confirmed icon addition, failed-add fallback, and Explorer `TaskbarCreated` recovery;
+- rich tray active-monitor/confirmed-volume/routing state, Refresh, stable-identity switching, Restore, and Exit;
 - disconnect/stale-handle behavior without leaving keys unexpectedly consumed.
 
 Manual DDC tests can be audible and mutate monitor state. Record what was actually exercised; do not imply hardware or OS coverage that was not run.
@@ -158,6 +159,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Do not assume a listed monitor supports volume. Enumeration precedes the selected monitor's volume read.
 - Display/device notifications trigger debounced discovery with bounded retries; every actual write also reacquires monitor wrappers. Do not claim that external OSD/program volume changes are polled.
 - Preserve the acknowledged tray-show handshake: never withdraw Tk until the tray thread confirms `Shell_NotifyIconW` success. Tray errors must keep or restore the main window, and a `TaskbarCreated` broadcast must re-add an icon that was intended to be visible.
+- Preserve immutable lock-protected tray snapshots and dispatch monitor command IDs against the snapshot that built the open menu. Never call Tk from the tray thread; Refresh and stable-identity monitor switching must enqueue through `_post_to_ui()`.
 - Preserve the session-local named mutex before Tk initialization and retain its handle through main-loop exit. Duplicate launch must not read settings or initialize hooks, tray state, or DDC workers; its restore broadcast is best-effort.
 - Configure logging only after acquiring the session mutex so duplicate processes never contend for rotation. Logging setup must remain nonfatal, bounded, and free of deliberate monitor identity or secret fields.
 - Preserve autostart as an explicit current-user checkbox. Keep registry failures nonfatal, quote source/executable paths, reject commands beyond 260 characters, prefer `pythonw.exe` for source, and use `sys.argv[0]` for Nuitka one-file builds so temporary extraction paths are never registered.

@@ -41,7 +41,13 @@ from theme import (
     apply_window_chrome,
     is_windows_dark_mode_enabled,
 )
-from windows_platform import DisplayChangeListener, GlobalVolumeKeyListener, TrayIconController
+from windows_platform import (
+    DisplayChangeListener,
+    GlobalVolumeKeyListener,
+    TrayIconController,
+    TrayMenuState,
+    TrayMonitorMenuItem,
+)
 
 
 RefreshResult: TypeAlias = tuple[list[MonitorRef], SelectionMatch, int | None, Exception | None]
@@ -291,7 +297,12 @@ class MonitorVolumeApp:
                 on_exit=lambda: self._post_to_ui(self.on_close),
                 on_error=self._handle_tray_error_from_thread,
                 icon_path=self.app_icon_path,
+                on_refresh=lambda: self._post_to_ui(self.refresh_monitors),
+                on_select_monitor=lambda selection: self._post_to_ui(
+                    lambda target=selection: self._select_monitor_from_tray(target)
+                ),
             )
+            self._sync_tray_menu_state()
             self._tray_icon.start()
         except Exception as exc:
             LOGGER.error("Tray icon startup failed (%s).", exc.__class__.__name__)
@@ -576,6 +587,7 @@ class MonitorVolumeApp:
             and self._listener is not None
             and self._listener.is_active
         )
+        self._sync_tray_menu_state()
 
     def _remember_selected_monitor(self, selection: SavedMonitorSelection) -> None:
         self.selected_key = selection
@@ -600,6 +612,7 @@ class MonitorVolumeApp:
             self.volume_text_var.set("--")
         else:
             self.volume_text_var.set(f"{clamp(volume, 0, 100)}%")
+        self._sync_tray_menu_state()
 
     def _show_volume_overlay(self, volume: int | None = None) -> None:
         if self._closing or self._overlay is None:
@@ -643,6 +656,47 @@ class MonitorVolumeApp:
             self.monitor_var.set("")
         else:
             self.monitor_combo.current(selected_index)
+        self._sync_tray_menu_state()
+
+    def _sync_tray_menu_state(self) -> None:
+        tray_icon = getattr(self, "_tray_icon", None)
+        if tray_icon is None:
+            return
+
+        selected_key = getattr(self, "selected_key", None)
+        active_monitor = selected_key.description if selected_key is not None else None
+        monitor_items: list[TrayMonitorMenuItem] = []
+        for monitor_ref in getattr(self, "monitors", ()):
+            selection = monitor_ref.selection_key
+            if selection is None:
+                continue
+            active = selection == selected_key
+            if active:
+                active_monitor = monitor_ref.display_name
+            monitor_items.append(
+                TrayMonitorMenuItem(
+                    label=monitor_ref.display_name,
+                    selection=selection,
+                    active=active,
+                )
+            )
+
+        tray_icon.update_menu_state(
+            TrayMenuState(
+                active_monitor=active_monitor,
+                current_volume=getattr(self, "current_volume", None),
+                routing_enabled=bool(getattr(self, "_hotkeys_enabled", False)),
+                monitors=tuple(monitor_items),
+            )
+        )
+
+    def _select_monitor_from_tray(self, selection: SavedMonitorSelection) -> None:
+        if self._closing:
+            return
+        if self._busy:
+            self._set_status("Wait for the current monitor operation before switching monitors.")
+            return
+        self.refresh_monitors(selection_target=selection)
 
     @staticmethod
     def _selection_error_message(status: SelectionMatchStatus) -> str:

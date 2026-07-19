@@ -11,7 +11,7 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 3. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference, reads the optional current-user autostart value, and loads the saved monitor selection and Change speed preference from `settings.py`.
 4. It builds the fixed-size control window, status bar, and hidden `overlay.VolumeOverlay` on the Tk thread.
 5. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
-6. It independently starts the tray controller and global keyboard hook. Their failures remain nonfatal to the other subsystems.
+6. It independently starts the tray controller and global keyboard hook. Tk publishes immutable menu snapshots to the tray, while tray Refresh/selection/restore/exit actions enqueue Tk callbacks. Their failures remain nonfatal to the other subsystems.
 7. It schedules the recurring Tk queue poll and a one-shot initial monitor refresh after 50 ms.
 8. The refresh worker enumerates DDC wrappers and Windows monitor identities, exact-matches the saved target, and reads its volume. With no saved selection, automatic selection occurs only when exactly one verifiable monitor exists.
 9. The worker enqueues a tokened completion callback. The Tk queue poll applies the monitor list, selection, displayed volume, readiness, and status text.
@@ -29,7 +29,7 @@ Source execution uses one interactive process per Windows session, enforced by `
 | --- | --- | --- | --- |
 | Tk main thread | Process lifetime | Widgets, state mutation, selection persistence, status, overlay, queue draining, diagnostic-handler lifecycle | Receives queued callables and key deltas every 50 ms |
 | `display-change-listener` | Long-lived daemon | Hidden Win32 window, monitor device registration, `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` message pump | Invalidates the topology generation and enqueues Tk work |
-| `tray-icon` | Long-lived daemon | Hidden Win32 window, notification icon, native menu, message pump | Controller callbacks enqueue Tk work through `_post_to_ui()` |
+| `tray-icon` | Long-lived daemon | Hidden Win32 window, notification icon, live snapshot menu, message pump | Reads lock-protected immutable state; controller actions enqueue Tk work through `_post_to_ui()` |
 | `volume-key-hook` | Long-lived daemon | `WH_KEYBOARD_LL` hook and message pump | Reads readiness through `should_consume()` and enqueues integer deltas |
 | `ddc-gui-worker` | One short-lived daemon per accepted refresh/selection read | Enumeration and selected-monitor volume reads | Enqueues success or failure callable |
 | `ddc-volume-write` | One short-lived daemon at a time | Selected-monitor set followed by readback | Enqueues write success or failure callable |
@@ -69,12 +69,12 @@ The guard is acquired before logging or Tk and always closed in `finally`. This 
 | `app.py` | Enforces the single-instance boundary, then creates and runs the application. |
 | `autostart.py` | Quotes source/packaged launch commands and reads/writes the named current-user Run value. |
 | `diagnostics.py` | Configures and closes the bounded per-user rotating log and provides component loggers. |
-| `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, persistence calls, tray lifecycle, and shutdown. |
+| `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, persistence calls, tray state/lifecycle, and shutdown. |
 | `ddc.py` | Defines `MonitorRef`, selection identity, monitor discovery, clamping, and DDC read/change/write wrappers. |
 | `settings.py` | Atomically loads and replaces the selected-monitor and Change speed JSON settings. |
 | `overlay.py` | Implements topmost transient volume and unavailable/error presentations. |
 | `theme.py` | Samples the Windows theme, defines ttk dark styling, applies DWM dark chrome, and resolves the icon. |
-| `windows_platform.py` | Declares the Win32 ctypes ABI and implements the single-instance mutex/restore signal, monitor identity/EDID inventory, display notifications, tray, keyboard-hook, and DWM helpers. |
+| `windows_platform.py` | Declares the Win32 ctypes ABI and implements the single-instance mutex/restore signal, monitor identity/EDID inventory, display notifications, snapshot-driven tray menu, keyboard-hook, and DWM helpers. |
 | `main.py` | Rejects the old launch path. |
 
 `ddc.change_monitor_volume()` is an internal helper but is not used by the GUI. The GUI uses its own cached-target and serialized-write flow so rapid key events can be coalesced.
@@ -190,7 +190,12 @@ There is no user preference to disable the hook while leaving the app running. D
 - Icon ID: `1`
 - Tooltip: `windows-ddc`
 - Double-click: Restore
-- Context menu: Restore (`1001`) and Exit (`1002`)
+- Context menu status: active monitor, last confirmed volume, and routing enabled/disabled
+- Context menu actions: Restore (`1001`), Exit (`1002`), Refresh (`1003`), and up to 100 selectable monitor commands starting at `2000`
+
+Tk builds `TrayMenuState` from `selected_key`, confirmed `current_volume`, `_hotkeys_enabled`, and every currently verifiable monitor, then replaces the controller's snapshot under a lock whenever those values change. The tray thread copies the snapshot when the popup opens. Checked monitor entries retain that captured `SavedMonitorSelection`; even if Tk publishes a newer list while the native menu is open, its returned command maps to the old menu's exact identity rather than the same numeric index in the new list. Labels normalize whitespace, escape Win32 mnemonic ampersands, and are bounded to 96 characters.
+
+Refresh and monitor-switch callbacks never invoke Tk directly. The controller calls closures that enqueue `refresh_monitors()` or `_select_monitor_from_tray()` through `_post_to_ui()`. A switch starts normal exact-identity discovery/read and is rejected while another DDC operation is active. Menu volume remains the authoritative read/readback value during optimistic or coalesced writes; routing reflects the same `_hotkeys_enabled` state used by the native hook.
 
 The controller tries to load `windows-ddc.ico` at the Windows small-icon dimensions and falls back to `IDI_APPLICATION`. The main Tk window also tries the same tracked icon; icon failure is nonfatal.
 
@@ -348,7 +353,7 @@ Known failure-state caveats include:
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, source/packaged autostart command quoting and mocked registry behavior, diagnostic writing/rotation/setup failure, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, source/packaged autostart command quoting and mocked registry behavior, diagnostic writing/rotation/setup failure, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, rich tray rendering/snapshot command stability/Tk queue routing, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
 
 `.github/workflows/ci.yml` runs on `windows-latest` for pushes, pull requests, and manual dispatches with a Python 3.10/3.14 matrix. It installs the runtime project, runs the unit suite, compiles runtime modules, checks installed dependencies, parses `build_exe.ps1` without executing it, checks tracked/staged whitespace, and requires a clean repository state. It neither starts `app.py` nor invokes hardware tools, monitor enumeration, the Nuitka build, publishing, or deployment. `tests/test_ci_workflow.py` locks down that hardware-free contract.
 
@@ -365,6 +370,7 @@ An authorized manual Windows/hardware pass is required for changes to discovery,
 - Keep monitorcontrol operations inside the monitor context manager and clamp all public volume results/targets to `0`–`100`.
 - Preserve system key pass-through until a selected monitor has a successful volume read, and clear/pass through safely on loss of readiness.
 - Keep native ctypes callbacks strongly referenced and stop display/hook/tray loops before destroying Tk.
+- Keep tray state immutable and lock-protected, and keep the menu-open snapshot paired with its command IDs. Tray actions must enter Tk through `_post_to_ui()` and monitor switching must revalidate the captured stable identity.
 - Do not use the displayed index or description ordinal as current persistent identity. Preserve version-2 matching and backward-compatible legacy loading.
 - Never touch live per-user settings or diagnostics in automated work; use temporary paths.
 - Never touch the live Run value in automated work. Preserve current-user-only opt-in writes, Windows quoting, the command-length check, source `pythonw.exe` preference, and original one-file executable path.

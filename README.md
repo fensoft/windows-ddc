@@ -23,7 +23,7 @@ These manually maintained captures predate the wider serial-bearing monitor sele
 - Provides a slider and `-`/`+` buttons with a persistent Slow, Medium, or Fast change speed.
 - Intercepts the global Windows Volume Down and Volume Up keys only while the native hook is live and a target is ready.
 - Shows volume and fail-closed monitor errors in a bottom-centered, best-effort topmost overlay.
-- Starts in the Windows notification area only after Windows confirms the icon was added, with Restore and Exit actions plus Explorer-restart recovery.
+- Starts in the Windows notification area only after Windows confirms the icon was added, with live monitor/volume/routing status, Refresh, quick monitor switching, Restore, Exit, and Explorer-restart recovery.
 - Remembers the selected physical monitor by EDID manufacturer/product/serial when available, with a Windows device-path fallback.
 - Invalidates monitor control on Windows display/device notifications and reacquires fresh DDC handles before every actual write.
 - Follows the current user's Windows light/dark application preference at startup.
@@ -93,7 +93,7 @@ and exits with status `1`. `windows-ddc` itself defines no console entry point o
 1. Enable DDC/CI in the monitor's on-screen settings before starting the application.
 2. Start `windows-ddc.exe` or run `python app.py`.
 3. Look in the notification area, including its overflow menu. The control window hides only after Windows confirms that the tray icon was added; otherwise it remains available with an error in the status bar.
-4. Double-click the tray icon, or right-click it and choose **Restore**.
+4. Double-click the tray icon to restore the window, or right-click it for live status, Refresh, monitor switching, Restore, and Exit.
 5. Choose the intended monitor and wait for the status bar to report a successful volume read.
 6. Test at a safe listening level with the buttons or slider before relying on the global volume keys.
 
@@ -108,12 +108,15 @@ With no saved selection, the app selects automatically only when exactly one ver
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
 | Change volume | Choose a Slow (`+1`), Medium (`+2`), or Fast (`+3`) change speed, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
 | Start with Windows | Select the checkbox to write a current-user Run entry for the present source or executable path. Clear it to remove that entry. No administrator access is required. |
+| Tray menu | Right-click the icon to see the active monitor, last confirmed volume, and whether global volume-key routing is enabled. Use **Refresh**, choose a verified monitor for exact-match revalidation, or use **Restore**/**Exit**. |
 | Refresh | Re-enumerates monitors and reads the exact saved selection again. It never falls back to a different monitor. |
 | Minimize | Sends the control window to the notification area only after confirmed icon addition; failure restores the normal window. |
 | Close the restored window | Exits the application; it does not merely hide the window. |
 | Exit from the tray | Removes the hook and tray icon, closes the overlay, and exits. |
 
 Monitor discovery is event-driven rather than periodic. Windows display and monitor-device notifications immediately suspend control and schedule a debounced refresh with bounded retries. The displayed volume is not polled for changes made by another program or the monitor's OSD.
+
+The tray menu is built from a thread-safe immutable snapshot supplied by Tk. A monitor click retains the stable selection identity represented when that menu opened, even if discovery updates concurrently, and all actions are queued back to Tk. Switching is refused while another monitor operation is active; Refresh retains the existing deferred-refresh behavior. The menu's volume is the last confirmed read/readback, not an optimistic pending slider target.
 
 Change speed defaults to Slow (`+1`) when no valid preference is saved. Medium changes by `2` and Fast changes by `3`. The selected speed applies to both the on-screen `-`/`+` buttons and the global Volume Down/Up keys, updates the live hook immediately, and is saved in `settings.json`.
 
@@ -274,7 +277,7 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, autostart command/registry behavior, diagnostics rotation, topology generations, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, changes the live Run key, or contacts monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, autostart command/registry behavior, diagnostics rotation, topology generations, fresh-handle revalidation, single-instance behavior, resilience, rich tray-menu snapshots/commands, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, changes the live Run key, or contacts monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -300,7 +303,7 @@ if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 
 CI installs only the runtime project with `python -m pip install -e .`; it does not install the optional Nuitka build extra or publish artifacts. A workflow contract test keeps the supported Python boundary, low-risk commands, and prohibited hardware/runtime commands explicit.
 
-Changes to GUI, autostart, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, Start with Windows enable/disable and restart persistence, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change the current-user Run key, physical monitor volume, and user-session keyboard behavior.
+Changes to GUI, autostart, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, Start with Windows enable/disable and restart persistence, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay errors, key pass-through while invalid, hook/listener failure, rich tray status/Refresh/monitor switching, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change the current-user Run key, physical monitor volume, and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 
@@ -311,6 +314,7 @@ For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 | No window appears | Check the notification area and its overflow menu, then double-click the icon or choose **Restore**. Tray-first startup is expected. |
 | Launching a second copy does nothing | The second process exits intentionally after asking the existing tray instance to restore. Check the existing window and notification area; restoration is best-effort during very early startup or shutdown. |
 | The tray icon cannot be added or disappears | The main window remains visible or is restored automatically. After Explorer restarts, the app re-adds an icon that was visible; if recovery fails, read the restored window's status bar. |
+| Tray monitor switching says to wait | A discovery, read, or write is active. Let it finish, reopen the tray menu, and select the monitor again. |
 | `No DDC/CI monitors found.` | Enable DDC/CI in the monitor OSD, confirm the monitor exposes DDC/CI over the active connection, then choose **Refresh**. |
 | A monitor is listed but volume remains `--` | Enumeration succeeded but its volume read did not. Read the status, try another monitor, and confirm the target supports DDC/CI audio volume. |
 | A monitor operation timed out | Wait for automatic Refresh. If the status does not change because the native DDC call never returns, restart the app; it intentionally will not start another hardware call concurrently. |

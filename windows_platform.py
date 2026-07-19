@@ -47,6 +47,9 @@ NIM_SETVERSION = 0x00000004
 NOTIFYICON_VERSION_4 = 4
 LR_LOADFROMFILE = 0x0010
 MF_STRING = 0x00000000
+MF_GRAYED = 0x00000001
+MF_CHECKED = 0x00000008
+MF_SEPARATOR = 0x00000800
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
 SM_CXSMICON = 49
@@ -859,10 +862,28 @@ class _TrayShowRequest:
         self.error: Exception | None = None
 
 
+@dataclass(frozen=True)
+class TrayMonitorMenuItem:
+    label: str
+    selection: object
+    active: bool = False
+
+
+@dataclass(frozen=True)
+class TrayMenuState:
+    active_monitor: str | None = None
+    current_volume: int | None = None
+    routing_enabled: bool = False
+    monitors: tuple[TrayMonitorMenuItem, ...] = ()
+
+
 class TrayIconController:
     ICON_ID = 1
     MENU_RESTORE = 1001
     MENU_EXIT = 1002
+    MENU_REFRESH = 1003
+    MENU_MONITOR_BASE = 2000
+    MAX_MONITOR_MENU_ITEMS = 100
     SHOW_TIMEOUT_SECONDS = 2.0
     START_TIMEOUT_SECONDS = NATIVE_START_TIMEOUT_SECONDS
     STOP_TIMEOUT_SECONDS = NATIVE_STOP_TIMEOUT_SECONDS
@@ -874,11 +895,15 @@ class TrayIconController:
         on_exit: Callable[[], None],
         on_error: Callable[[Exception], None],
         icon_path: Path | None = None,
+        on_refresh: Callable[[], None] | None = None,
+        on_select_monitor: Callable[[object], None] | None = None,
     ) -> None:
         self.tooltip = tooltip[:127]
         self.on_restore = on_restore
         self.on_exit = on_exit
         self.on_error = on_error
+        self.on_refresh = on_refresh or (lambda: None)
+        self.on_select_monitor = on_select_monitor or (lambda _selection: None)
         self._icon_path = str(icon_path) if icon_path is not None else None
         self._instance = kernel32.GetModuleHandleW(None)
         self._class_name = f"MonitorVolumeTrayWindow_{os.getpid()}_{id(self)}"
@@ -902,6 +927,8 @@ class TrayIconController:
         self._show_requests_lock = threading.Lock()
         self._show_requests: dict[int, _TrayShowRequest] = {}
         self._next_show_request_id = 1
+        self._menu_state_lock = threading.Lock()
+        self._menu_state = TrayMenuState()
 
     @property
     def is_visible(self) -> bool:
@@ -952,6 +979,14 @@ class TrayIconController:
     def hide(self) -> None:
         if self._hwnd is not None:
             user32.PostMessageW(self._hwnd, WM_TRAY_HIDE, 0, 0)
+
+    def update_menu_state(self, state: TrayMenuState) -> None:
+        with self._menu_state_lock:
+            self._menu_state = state
+
+    def _get_menu_state(self) -> TrayMenuState:
+        with self._menu_state_lock:
+            return self._menu_state
 
     def _request_stop(self) -> None:
         self._stop_requested.set()
@@ -1053,11 +1088,7 @@ class TrayIconController:
             return 0
         if msg == WM_COMMAND:
             command_id = w_param & 0xFFFF
-            if command_id == self.MENU_RESTORE:
-                self.on_restore()
-                return 0
-            if command_id == self.MENU_EXIT:
-                self.on_exit()
+            if self._dispatch_menu_command(command_id):
                 return 0
         if msg == WM_TRAYICON:
             tray_event = l_param & 0xFFFF
@@ -1141,18 +1172,56 @@ class TrayIconController:
         self._icon_visible = False
 
     def _show_context_menu(self, hwnd: wintypes.HWND) -> None:
+        state = self._get_menu_state()
+        monitor_items = state.monitors[: self.MAX_MONITOR_MENU_ITEMS]
         menu = user32.CreatePopupMenu()
         if not menu:
             self.on_error(win_error("CreatePopupMenu failed"))
             return
 
         try:
-            if not user32.AppendMenuW(menu, MF_STRING, self.MENU_RESTORE, "Restore"):
-                self.on_error(win_error("AppendMenuW failed"))
+            active_monitor = state.active_monitor or "Not selected"
+            current_volume = (
+                "--" if state.current_volume is None else f"{state.current_volume}%"
+            )
+            routing_state = "Enabled" if state.routing_enabled else "Disabled"
+            entries = (
+                (MF_STRING | MF_GRAYED, 0, f"Active monitor: {active_monitor}"),
+                (MF_STRING | MF_GRAYED, 0, f"Current volume: {current_volume}"),
+                (MF_STRING | MF_GRAYED, 0, f"Routing: {routing_state}"),
+                (MF_SEPARATOR, 0, None),
+                (MF_STRING, self.MENU_REFRESH, "Refresh"),
+                (MF_STRING | MF_GRAYED, 0, "Switch monitor"),
+            )
+            for flags, command_id, label in entries:
+                if not self._append_menu_item(menu, flags, command_id, label):
+                    return
+
+            if monitor_items:
+                for index, item in enumerate(monitor_items):
+                    flags = MF_STRING | (MF_CHECKED if item.active else 0)
+                    if not self._append_menu_item(
+                        menu,
+                        flags,
+                        self.MENU_MONITOR_BASE + index,
+                        item.label,
+                    ):
+                        return
+            elif not self._append_menu_item(
+                menu,
+                MF_STRING | MF_GRAYED,
+                0,
+                "No selectable monitors",
+            ):
                 return
-            if not user32.AppendMenuW(menu, MF_STRING, self.MENU_EXIT, "Exit"):
-                self.on_error(win_error("AppendMenuW failed"))
-                return
+
+            for flags, command_id, label in (
+                (MF_SEPARATOR, 0, None),
+                (MF_STRING, self.MENU_RESTORE, "Restore"),
+                (MF_STRING, self.MENU_EXIT, "Exit"),
+            ):
+                if not self._append_menu_item(menu, flags, command_id, label):
+                    return
 
             point = wintypes.POINT()
             if not user32.GetCursorPos(ctypes.byref(point)):
@@ -1171,12 +1240,51 @@ class TrayIconController:
             )
             user32.PostMessageW(hwnd, WM_NULL, 0, 0)
 
-            if command_id == self.MENU_RESTORE:
-                self.on_restore()
-            elif command_id == self.MENU_EXIT:
-                self.on_exit()
+            self._dispatch_menu_command(command_id, monitor_items)
         finally:
             user32.DestroyMenu(menu)
+
+    def _append_menu_item(
+        self,
+        menu: HMENU,
+        flags: int,
+        command_id: int,
+        label: str | None,
+    ) -> bool:
+        menu_label = None if label is None else self._format_menu_label(label)
+        if user32.AppendMenuW(menu, flags, command_id, menu_label):
+            return True
+        self.on_error(win_error("AppendMenuW failed"))
+        return False
+
+    @staticmethod
+    def _format_menu_label(label: str, limit: int = 96) -> str:
+        normalized = " ".join(label.replace("&", "&&").split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 1].rstrip() + "…"
+
+    def _dispatch_menu_command(
+        self,
+        command_id: int,
+        monitor_items: tuple[TrayMonitorMenuItem, ...] | None = None,
+    ) -> bool:
+        if command_id == self.MENU_RESTORE:
+            self.on_restore()
+            return True
+        if command_id == self.MENU_EXIT:
+            self.on_exit()
+            return True
+        if command_id == self.MENU_REFRESH:
+            self.on_refresh()
+            return True
+
+        items = monitor_items if monitor_items is not None else self._get_menu_state().monitors
+        item_index = command_id - self.MENU_MONITOR_BASE
+        if 0 <= item_index < min(len(items), self.MAX_MONITOR_MENU_ITEMS):
+            self.on_select_monitor(items[item_index].selection)
+            return True
+        return False
 
 
 class GlobalVolumeKeyListener:

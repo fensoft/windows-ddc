@@ -18,6 +18,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 - Added Windows GitHub Actions CI across Python 3.10 and 3.14 for the hardware-free unit suite and all low-risk repository checks.
 - Added bounded per-user rotating diagnostics for lifecycle, settings, native-subsystem, DDC, UI-callback, and shutdown failures, with isolated hardware-free coverage.
 - Added an opt-in **Start with Windows** checkbox backed by the current-user Run key, with safe source/one-file command quoting, nonfatal error handling, and mocked registry coverage.
+- Added a live tray menu with active monitor, confirmed volume, routing state, Refresh, stable-identity monitor switching, Restore, and Exit actions.
 
 ### Changed
 
