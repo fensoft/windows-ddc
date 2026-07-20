@@ -9,13 +9,13 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, autostart command/registry behavior, rotating diagnostics, display invalidation, fresh-handle revalidation, single-instance behavior, multi-screen overlay placement/focus safety, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
+- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, autostart command/registry behavior, rotating diagnostics, display invalidation, fresh-handle revalidation, single-instance behavior, multi-screen overlay placement/focus safety, live theme/accessibility/scaling, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
 
 ## Runtime Shape
 
 1. `app.py` acquires the session-local `SingleInstanceGuard` before creating Tk. A duplicate broadcasts restore and exits before application initialization.
 2. The primary configures the rotating diagnostic log, creates the single `tk.Tk`, constructs `gui.MonitorVolumeApp`, reads the current-user autostart state, and enters Tk's main loop while retaining the mutex handle.
-3. `display-change-listener`, `tray-icon`, and `volume-key-hook` are long-lived daemon threads with native Win32 message loops.
+3. `display-change-listener`, `tray-icon`, and `volume-key-hook` are long-lived daemon threads with native Win32 message loops. The display listener also relays live theme/system-color broadcasts into Tk.
 4. `ddc-gui-worker` and `ddc-volume-write` are short-lived daemon workers for blocking DDC/CI work.
 5. Worker and native-thread callbacks cross into Tk through `queue.Queue`; `_poll_queues()` drains them every 50 ms.
 6. Only one application-issued DDC operation should be active. Rapid writes are serialized and reduced to the latest `_pending_target_volume`. A timed-out operation keeps the slot until its worker returns; its late result is ignored and followed by read-only rediscovery.
@@ -32,13 +32,13 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `autostart.py` | Current-user Run-key state and quoted source/packaged launch commands. |
 | `diagnostics.py` | Nonfatal per-user rotating-log configuration and component logger access. |
 | `main.py` | Unsupported launcher stub; prints migration guidance and returns `1`. |
-| `gui.py` | UI state machine, selection, readiness, queues, worker serialization, overlay targeting, tray snapshots/actions, and window lifecycle. |
+| `gui.py` | UI state machine, selection, readiness, queues, worker serialization, live theme/DPI reflow, keyboard navigation, overlay targeting, tray snapshots/actions, and window lifecycle. |
 | `ddc.py` | Monitor identity, enumeration, clamping, and DDC read/write wrappers. |
 | `settings.py` | Per-user selected-monitor and Change speed JSON load/save. |
-| `overlay.py` | Work-area/DPI-aware, no-activate, topmost, auto-hiding volume `Toplevel`. |
-| `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
-| `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display work areas/scaling, no-activate overlay helpers, display notifications, snapshot-driven tray controller, global keyboard hook, and DWM helpers. |
-| `tests/` | Hardware-free hotkey, identity, settings, autostart, single-instance, topology-generation, fresh-write, overlay, resilience, and tray-recovery regressions. |
+| `overlay.py` | Work-area/DPI-aware, live-themed, no-activate, topmost, auto-hiding volume `Toplevel`. |
+| `theme.py` | Windows theme/High Contrast/window-DPI reads, reversible ttk styles, DWM chrome, and runtime icon path. |
+| `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display work areas/scaling, window DPI/High Contrast reads, no-activate overlay helpers, display/theme notifications, snapshot-driven tray controller, global keyboard hook, and DWM helpers. |
+| `tests/` | Hardware-free hotkey, identity, settings, autostart, single-instance, topology-generation, fresh-write, overlay, live-theme/accessibility/scaling, resilience, and tray-recovery regressions. |
 | `.github/workflows/ci.yml` | Windows Python 3.10/3.14 hardware-free unit and low-risk validation workflow. |
 | `pyproject.toml` | Python requirement, dependency pins, and installed flat modules. |
 | `build_exe.ps1` | One-file Nuitka build for `dist\windows-ddc.exe`. |
@@ -138,6 +138,7 @@ GUI, tray, hook, theme, or DDC changes require an authorized Windows/manual pass
 - key pass-through before readiness and after exit;
 - rapid-write coalescing and `0`/`100` boundaries;
 - overlay visibility, auto-hide, cursor-screen/selected-display-fallback placement, mixed-DPI work areas, and focus preservation;
+- live light/dark/High Contrast transitions, `Tab`/`Shift+Tab` traversal, access keys, descriptive button names, slider boundary/page keys, and control-window mixed-DPI reflow;
 - minimize, restore, Refresh, and clean shutdown;
 - confirmed icon addition, failed-add fallback, and Explorer `TaskbarCreated` recovery;
 - rich tray active-monitor/confirmed-volume/routing state, Refresh, stable-identity switching, Restore, and Exit;
@@ -149,6 +150,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 
 - Do not perform blocking DDC work on the Tk thread.
 - Do not mutate Tk state directly from another thread. Keep callbacks small and exception-safe so `_poll_queues()` continues rescheduling itself.
+- Route theme/system-color messages from the native listener through `_post_to_ui()`. Preserve the debounce, reversible light/dark palettes and chrome, Windows system colors in High Contrast, and per-window DPI reflow.
 - Preserve `_volume_write_inflight` / `_pending_target_volume` serialization. Do not introduce concurrent operations against the selected monitor wrapper.
 - Do not broaden key consumption beyond `_hotkeys_enabled`. Readiness also requires a live display listener and valid topology event. Display notification, Refresh start, selection clearing, listener error, write failure, and shutdown clear it. Preserve the per-press consume/pass-through decision through matching key-up and the one-notice unavailable latch. Test hook/display-listener failures, reads, writes, Refresh, disconnect, shutdown, and held keys across transitions.
 - Keep ctypes callback objects (`_wndproc` and `_hook_callback`) strongly referenced for their controllers' lifetimes. Incorrect ctypes signatures or callback lifetimes can crash the process.

@@ -21,6 +21,13 @@ OVERLAY_SUBTEXT = "#D0D0D0"
 OVERLAY_ACCENT = "#4CC2FF"
 OVERLAY_ERROR = "#FF6B6B"
 OVERLAY_TRACK = "#2A2A2A"
+LIGHT_OVERLAY_BG = "#F7F7F7"
+LIGHT_OVERLAY_BORDER = "#C8C8C8"
+LIGHT_OVERLAY_TEXT = "#111111"
+LIGHT_OVERLAY_SUBTEXT = "#404040"
+LIGHT_OVERLAY_ACCENT = "#0067C0"
+LIGHT_OVERLAY_ERROR = "#B10E1E"
+LIGHT_OVERLAY_TRACK = "#D8D8D8"
 AUTO_HIDE_MS = 1400
 ERROR_AUTO_HIDE_MS = 2800
 PROGRESS_STYLE = "VolumeOverlay.Horizontal.TProgressbar"
@@ -42,6 +49,18 @@ class OverlayGeometry:
     y: int
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class OverlayPalette:
+    background: str
+    border: str
+    text: str
+    subtext: str
+    accent: str
+    error: str
+    track: str
+    alpha: float
 
 
 def calculate_overlay_geometry(
@@ -66,20 +85,20 @@ def calculate_overlay_geometry(
 
 
 class VolumeOverlay:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        dark_mode: bool = True,
+        high_contrast: bool = False,
+    ) -> None:
         self.root = root
         self._hide_after_id: str | None = None
         self._style = ttk.Style(root)
-        self._ensure_style()
+        self._palette = self._get_palette(dark_mode, high_contrast)
 
         self.window = tk.Toplevel(root, takefocus=False)
         self.window.withdraw()
         self.window.overrideredirect(True)
-        self.window.configure(bg=OVERLAY_BORDER)
-        try:
-            self.window.attributes("-alpha", 0.7)
-        except tk.TclError:
-            pass
         try:
             self.window.attributes("-toolwindow", True)
         except tk.TclError:
@@ -89,42 +108,40 @@ class VolumeOverlay:
         self.volume_var = tk.StringVar(value="0%")
         self.error_var = tk.StringVar(value="")
 
-        border = tk.Frame(self.window, bg=OVERLAY_BORDER, bd=0, highlightthickness=0)
-        border.pack()
+        self.border = tk.Frame(self.window, bd=0, highlightthickness=0)
+        self.border.pack()
 
-        content = tk.Frame(border, bg=OVERLAY_BG, padx=OVERLAY_CONTENT_PADX, pady=OVERLAY_CONTENT_PADY)
-        content.pack(padx=1, pady=1)
+        self.content = tk.Frame(
+            self.border,
+            padx=OVERLAY_CONTENT_PADX,
+            pady=OVERLAY_CONTENT_PADY,
+        )
+        self.content.pack(padx=1, pady=1)
 
         self.title_label = tk.Label(
-            content,
+            self.content,
             textvariable=self.title_var,
-            bg=OVERLAY_BG,
-            fg=OVERLAY_SUBTEXT,
             font=OVERLAY_LABEL_FONT,
         )
         self.title_label.pack(anchor="w")
 
         self.value_label = tk.Label(
-            content,
+            self.content,
             textvariable=self.volume_var,
-            bg=OVERLAY_BG,
-            fg=OVERLAY_TEXT,
             font=OVERLAY_VALUE_FONT,
         )
         self.value_label.pack(anchor="w", pady=(1, 8))
 
         self.error_label = tk.Label(
-            content,
+            self.content,
             textvariable=self.error_var,
-            bg=OVERLAY_BG,
-            fg=OVERLAY_TEXT,
             font=OVERLAY_LABEL_FONT,
             justify="left",
             wraplength=OVERLAY_ERROR_WRAP,
         )
 
         self.progress = ttk.Progressbar(
-            content,
+            self.content,
             style=PROGRESS_STYLE,
             orient=tk.HORIZONTAL,
             mode="determinate",
@@ -133,17 +150,65 @@ class VolumeOverlay:
         )
         self.progress.pack(fill="x")
 
+        self.apply_theme(dark_mode, high_contrast)
         self.window.update_idletasks()
         self._configure_no_activate()
 
-    def _ensure_style(self) -> None:
+    @staticmethod
+    def _get_palette(dark_mode: bool, high_contrast: bool) -> OverlayPalette:
+        if high_contrast:
+            return OverlayPalette(
+                background="SystemWindow",
+                border="SystemWindowText",
+                text="SystemWindowText",
+                subtext="SystemWindowText",
+                accent="SystemHighlight",
+                error="SystemWindowText",
+                track="SystemWindow",
+                alpha=1.0,
+            )
+        if dark_mode:
+            return OverlayPalette(
+                background=OVERLAY_BG,
+                border=OVERLAY_BORDER,
+                text=OVERLAY_TEXT,
+                subtext=OVERLAY_SUBTEXT,
+                accent=OVERLAY_ACCENT,
+                error=OVERLAY_ERROR,
+                track=OVERLAY_TRACK,
+                alpha=0.7,
+            )
+        return OverlayPalette(
+            background=LIGHT_OVERLAY_BG,
+            border=LIGHT_OVERLAY_BORDER,
+            text=LIGHT_OVERLAY_TEXT,
+            subtext=LIGHT_OVERLAY_SUBTEXT,
+            accent=LIGHT_OVERLAY_ACCENT,
+            error=LIGHT_OVERLAY_ERROR,
+            track=LIGHT_OVERLAY_TRACK,
+            alpha=0.85,
+        )
+
+    def apply_theme(self, dark_mode: bool, high_contrast: bool = False) -> None:
+        self._palette = self._get_palette(dark_mode, high_contrast)
+        palette = self._palette
+        self.window.configure(bg=palette.border)
+        self.border.configure(bg=palette.border)
+        self.content.configure(bg=palette.background)
+        self.title_label.configure(bg=palette.background, fg=palette.subtext)
+        self.value_label.configure(bg=palette.background, fg=palette.text)
+        self.error_label.configure(bg=palette.background, fg=palette.text)
+        try:
+            self.window.attributes("-alpha", palette.alpha)
+        except tk.TclError:
+            pass
         self._style.configure(
             PROGRESS_STYLE,
-            background=OVERLAY_ACCENT,
-            troughcolor=OVERLAY_TRACK,
-            bordercolor=OVERLAY_TRACK,
-            lightcolor=OVERLAY_ACCENT,
-            darkcolor=OVERLAY_ACCENT,
+            background=palette.accent,
+            troughcolor=palette.track,
+            bordercolor=palette.track,
+            lightcolor=palette.accent,
+            darkcolor=palette.accent,
             thickness=OVERLAY_BAR_THICKNESS,
         )
 
@@ -155,7 +220,7 @@ class VolumeOverlay:
         volume = max(0, min(volume, 100))
         self.title_var.set("Volume")
         self.volume_var.set(f"{volume}%")
-        self.value_label.configure(fg=OVERLAY_TEXT)
+        self.value_label.configure(fg=self._palette.text)
         self.error_var.set("")
         self.error_label.pack_forget()
         if not self.progress.winfo_manager():
@@ -170,7 +235,7 @@ class VolumeOverlay:
     ) -> None:
         self.title_var.set("Monitor volume")
         self.volume_var.set("Unavailable")
-        self.value_label.configure(fg=OVERLAY_ERROR)
+        self.value_label.configure(fg=self._palette.error)
         self.error_var.set(message.strip() or "Selected monitor is unavailable.")
         self.progress.pack_forget()
         if not self.error_label.winfo_manager():

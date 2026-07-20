@@ -8,9 +8,9 @@ There is no server-side tier. The project has no HTTP API, listening port, datab
 
 1. The supported entrypoint, `app.py`, acquires a session-local named mutex. A duplicate broadcasts a restore request and exits before creating Tk or application subsystems.
 2. The primary instance configures a rotating per-user diagnostic log, creates one `tk.Tk`, constructs `gui.MonitorVolumeApp`, and enters `root.mainloop()` while retaining the mutex handle.
-3. `MonitorVolumeApp.__init__()` samples the Windows app-theme preference, reads the optional current-user autostart value, and loads the saved monitor selection and Change speed preference from `settings.py`.
-4. It builds the fixed-size control window, status bar, and hidden, native-no-activate `overlay.VolumeOverlay` on the Tk thread.
-5. It starts a dedicated `DisplayChangeListener` hidden window. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
+3. `MonitorVolumeApp.__init__()` samples the Windows app-theme and High Contrast state, reads the optional current-user autostart value, and loads the saved monitor selection and Change speed preference from `settings.py`.
+4. It builds the keyboard-navigable, DPI-scaled control window, status bar, and hidden, native-no-activate `overlay.VolumeOverlay` on the Tk thread.
+5. It starts a dedicated `DisplayChangeListener` hidden window for topology and live theme/system-color broadcasts. Failure leaves all monitor-volume writes disabled; the app can still enumerate and display status.
 6. It independently starts the tray controller and global keyboard hook. Tk publishes immutable menu snapshots to the tray, while tray Refresh/selection/restore/exit actions enqueue Tk callbacks. Their failures remain nonfatal to the other subsystems.
 7. It schedules the recurring Tk queue poll and a one-shot initial monitor refresh after 50 ms.
 8. The refresh worker enumerates DDC wrappers and Windows monitor identities, exact-matches the saved target, and reads its volume. With no saved selection, automatic selection occurs only when exactly one verifiable monitor exists.
@@ -28,7 +28,7 @@ Source execution uses one interactive process per Windows session, enforced by `
 | Thread | Lifetime | Owns or performs | Communication boundary |
 | --- | --- | --- | --- |
 | Tk main thread | Process lifetime | Widgets, state mutation, selection persistence, status, overlay, queue draining, diagnostic-handler lifecycle | Receives queued callables and key deltas every 50 ms |
-| `display-change-listener` | Long-lived daemon | Hidden Win32 window, monitor device registration, `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` message pump | Invalidates the topology generation and enqueues Tk work |
+| `display-change-listener` | Long-lived daemon | Hidden Win32 window, monitor device registration, display/device and theme/system-color message pump | Invalidates the topology generation or enqueues a live-theme refresh in Tk |
 | `tray-icon` | Long-lived daemon | Hidden Win32 window, notification icon, live snapshot menu, message pump | Reads lock-protected immutable state; controller actions enqueue Tk work through `_post_to_ui()` |
 | `volume-key-hook` | Long-lived daemon | `WH_KEYBOARD_LL` hook and message pump | Reads readiness through `should_consume()` and enqueues integer deltas |
 | `ddc-gui-worker` | One short-lived daemon per accepted refresh/selection read | Enumeration and selected-monitor volume reads | Enqueues success or failure callable |
@@ -69,12 +69,12 @@ The guard is acquired before logging or Tk and always closed in `finally`. This 
 | `app.py` | Enforces the single-instance boundary, then creates and runs the application. |
 | `autostart.py` | Quotes source/packaged launch commands and reads/writes the named current-user Run value. |
 | `diagnostics.py` | Configures and closes the bounded per-user rotating log and provides component loggers. |
-| `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, overlay display targeting, persistence calls, tray state/lifecycle, and shutdown. |
+| `gui.py` | Coordinates Tk, monitor selection, readiness, DDC workers, rapid-write coalescing, live theme/DPI reflow, keyboard navigation, overlay targeting, persistence, tray lifecycle, and shutdown. |
 | `ddc.py` | Defines `MonitorRef`, selection identity, monitor discovery, clamping, and DDC read/change/write wrappers. |
 | `settings.py` | Atomically loads and replaces the selected-monitor and Change speed JSON settings. |
-| `overlay.py` | Calculates work-area/DPI-aware geometry and implements focus-safe topmost transient volume and unavailable/error presentations. |
-| `theme.py` | Samples the Windows theme, defines ttk dark styling, applies DWM dark chrome, and resolves the icon. |
-| `windows_platform.py` | Declares the Win32 ctypes ABI and implements the single-instance mutex/restore signal, monitor identity/EDID inventory, display work-area/scale lookup, no-activate overlay operations, display notifications, snapshot-driven tray menu, keyboard-hook, and DWM helpers. |
+| `overlay.py` | Calculates work-area/DPI-aware geometry and implements focus-safe, live-themed topmost volume and unavailable/error presentations. |
+| `theme.py` | Reads Windows theme/High Contrast/DPI state, defines reversible ttk styling, applies DWM chrome, and resolves the icon. |
+| `windows_platform.py` | Declares the Win32 ctypes ABI and implements the single-instance mutex/restore signal, monitor identity/EDID inventory, display work-area/window-DPI lookup, High Contrast query, no-activate overlay operations, display/theme notifications, snapshot-driven tray menu, keyboard hook, and DWM helpers. |
 | `main.py` | Rejects the old launch path. |
 
 `ddc.change_monitor_volume()` is an internal helper but is not used by the GUI. The GUI uses its own cached-target and serialized-write flow so rapid key events can be coalesced.
@@ -179,9 +179,11 @@ AND confirmed current volume exists
 
 There is no user preference to disable the hook while leaving the app running. Display invalidation or write failure clears readiness so subsequent physical presses pass through until exact-match rediscovery and a successful read. A hook failure disables only global interception; a display-listener failure disables all monitor-volume writes.
 
-## Display-change event flow
+## Display and theme event flow
 
-`DisplayChangeListener` owns a separate hidden window registered for `GUID_DEVINTERFACE_MONITOR`. `WM_DISPLAYCHANGE` and relevant `WM_DEVICECHANGE` messages synchronously clear a thread-safe topology-valid event and increment a generation before posting Tk work. Tk then clears cached/pending volume state and schedules a 500 ms debounced refresh; transient automatic failures retry after 1, 2, and 4 seconds. Callbacks do no blocking discovery or Tk work on the native thread.
+`DisplayChangeListener` owns a separate hidden window registered for `GUID_DEVINTERFACE_MONITOR`. `WM_DISPLAYCHANGE` and relevant `WM_DEVICECHANGE` messages synchronously clear a thread-safe topology-valid event and increment a generation before posting Tk work. Tk then clears cached/pending volume state and schedules a 500 ms debounced refresh; transient automatic failures retry after 1, 2, and 4 seconds.
+
+The same listener routes `WM_SETTINGCHANGE`, `WM_SYSCOLORCHANGE`, and `WM_THEMECHANGED` through `_post_to_ui()`. Tk debounces those broadcasts for 100 ms, rereads app-theme and High Contrast state, reapplies reversible widget/overlay palettes and DWM chrome, and reflows the control window. Native callbacks do no blocking discovery or Tk work on the listener thread.
 
 ## Tray and window event flow
 
@@ -207,17 +209,19 @@ Minimizing a visible Tk window schedules an idle check and withdraws it only if 
 
 ## Frontend and overlay
 
-The control window is a non-resizable Tk/ttk layout at least 520 pixels wide so serial-bearing monitor labels remain readable. It contains:
+The control window is horizontally resizable with a fixed content-driven height and a DPI-scaled 620-logical-pixel minimum width so serial-bearing monitor labels and descriptive actions remain readable. It contains:
 
 - a read-only monitor combobox;
 - Refresh;
 - a `0`–`100` scale;
-- a persistent Slow/Medium/Fast Change speed selector and decrement/increment buttons;
+- a persistent Slow/Medium/Fast Change speed selector and focusable **Decrease volume**/**Increase volume** buttons;
 - a percentage label and status bar.
 
 Widget state derives from `_busy`, monitor availability, confirmed volume, display-listener liveness, and topology validity. During a valid active write the volume controls remain enabled so a new last target can be queued.
 
-`VolumeOverlay` is a borderless tool `Toplevel` with fixed dark colors. Normal mode shows percentage/progress and hides after 1.4 seconds. Error mode shows a red `Unavailable` heading plus wrapped reason text, hides the progress bar, and remains for 2.8 seconds. Alpha `0.7` and Tk's tool-window attribute remain best-effort.
+All interactive widgets participate explicitly in `Tab`/`Shift+Tab` traversal. Underlined labels and controls expose `Alt+M`, `Alt+V`, `Alt+C`, `Alt+D`, `Alt+I`, `Alt+S`, and `Alt+R`; `Ctrl+R` and `F5` also refresh, and `Escape` minimizes to the tray. The slider maps `Home`/`End` to `0`/`100` and `Page Down`/`Page Up` to ten-point changes in addition to normal arrow-key navigation. Disabled shortcut targets are ignored.
+
+`VolumeOverlay` is a borderless tool `Toplevel` with a live palette. Normal mode shows percentage/progress and hides after 1.4 seconds. Error mode shows an `Unavailable` heading plus wrapped reason text, hides the progress bar, and remains for 2.8 seconds. Alpha is `0.7` in dark mode, `0.85` in light mode, and `1.0` in High Contrast; Tk's tool-window attribute remains best-effort.
 
 Every presentation takes a fresh `GetCursorPos` reading and current `MONITORINFOEXW` snapshots. The display containing the cursor wins. If the cursor cannot be resolved to an enumerated display, the selected `MonitorRef.display_device_name` is used, with the primary or first enumerated display as the final fallback. Geometry is bottom-centered inside `rcWork`, supports negative virtual-screen coordinates, scales the side/top/bottom margins with `GetScaleFactorForMonitor`, and clamps oversized content inside the available work area.
 
@@ -229,9 +233,11 @@ Focus safety is fail-closed. The native top-level HWND must accept the preserved
 HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme
 ```
 
-Only a DWORD value of `0` selects dark mode. The preference is sampled once at startup. Dark mode creates a custom ttk theme and tries DWM attributes `20` then `19`; light mode prefers `vista`, `xpnative`, then `winnative` when available. This theme lookup is read-only.
+Only a DWORD value of `0` selects dark mode. `SystemParametersInfoW(SPI_GETHIGHCONTRAST)` supplies the live High Contrast state; High Contrast suppresses the custom dark palette and uses Windows system color names throughout the Tk window and opaque overlay. Dark mode creates a custom ttk theme, while light/High Contrast prefers `vista`, `xpnative`, then `winnative` when available. DWM attributes `20` then `19` are applied in both directions so a live transition also clears dark title chrome. These lookups are read-only.
 
-The manually maintained screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). They predate the wider identity selector, Change speed selector, Start with Windows checkbox, and error presentation; there is no automated screenshot workflow, so updates require real scrubbed captures.
+`GetDpiForWindow` supplies the restored control window's current DPI with a 96-DPI fallback. Padding, slider length, and minimum width scale from logical values, and a debounced top-level `<Configure>` callback reapplies them only when the window DPI changes. Overlay geometry separately retains its per-destination-screen scale lookup.
+
+The manually maintained screenshots are tracked at `docs/app.png` (452×203) and `docs/overlay.png` (210×122). They predate the wider identity selector, Change speed selector, Start with Windows checkbox, descriptive volume buttons, live theme/scaling behavior, and error presentation; there is no automated screenshot workflow, so updates require real scrubbed captures.
 
 ## Persistent data, registry, and filesystem ownership
 
@@ -357,19 +363,20 @@ Known failure-state caveats include:
 
 ## Development and testing
 
-The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, source/packaged autostart command quoting and mocked registry behavior, diagnostic writing/rotation/setup failure, topology generations, display-message routing, fresh-wrapper writes, single-instance composition and signaling, rich tray rendering/snapshot command stability/Tk queue routing, multi-screen/work-area/DPI overlay placement, native no-activate behavior, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
+The standard-library test suite covers fail-safe hotkeys, EDID parsing, unique/duplicate/path identity matching, schema migration, Change speed persistence, source/packaged autostart command quoting and mocked registry behavior, diagnostic writing/rotation/setup failure, topology generations, display/theme-message routing, fresh-wrapper writes, single-instance composition and signaling, rich tray rendering/snapshot command stability/Tk queue routing, multi-screen/work-area/DPI overlay placement, native no-activate behavior, live dark/light/High Contrast palettes, keyboard bindings, window-DPI reflow, acknowledged tray addition, visible-window fallback, Explorer restart recovery, queue-callback containment, DDC watchdog state, bounded native lifecycle waits, CI workflow safety, and shutdown diagnostics. It has no third-party test framework, linter, formatter, or type checker.
 
 `.github/workflows/ci.yml` runs on `windows-latest` for pushes, pull requests, and manual dispatches with a Python 3.10/3.14 matrix. It installs the runtime project, runs the unit suite, compiles runtime modules, checks installed dependencies, parses `build_exe.ps1` without executing it, checks tracked/staged whitespace, and requires a clean repository state. It neither starts `app.py` nor invokes hardware tools, monitor enumeration, the Nuitka build, publishing, or deployment. `tests/test_ci_workflow.py` locks down that hardware-free contract.
 
 Do not use application launch as a routine smoke test. It reads and writes user settings, starts a global hook, creates native tray state, and contacts physical monitor hardware. `build_exe.ps1` also writes ignored artifacts and may download tooling.
 
-An authorized manual Windows/hardware pass is required for changes to discovery, selection, DDC I/O, key interception, Change speed, autostart, tray lifecycle, theme/chrome, overlay, or shutdown. Tests of settings code must patch `SETTINGS_PATH` to a temporary location; autostart tests must mock the registry. Pure DDC wrapper tests should use fake context-manager monitor objects.
+An authorized manual Windows/hardware pass is required for changes to discovery, selection, DDC I/O, key interception, Change speed, autostart, tray lifecycle, theme/chrome, accessibility/scaling, overlay, or shutdown. Tests of settings code must patch `SETTINGS_PATH` to a temporary location; autostart tests must mock the registry. Pure DDC wrapper tests should use fake context-manager monitor objects.
 
 ## Things to preserve
 
 - Keep `app.py` as the single supported composition root and `main.py` as an explicit unsupported stub unless compatibility policy changes.
 - Acquire and retain `SingleInstanceGuard` before creating Tk; duplicate launches must remain side-effect-free apart from the best-effort restore broadcast.
 - Keep all Tk access on the main thread; use `_result_queue`, `_hotkey_delta_queue`, and `_post_to_ui()` at cross-thread boundaries.
+- Route live theme broadcasts through `_post_to_ui()` and preserve debouncing, reversible light/dark chrome, Windows system colors in High Contrast, and current-window DPI reflow.
 - Keep DDC work off Tk and serialize/coalesce writes. Do not start one hardware worker per key event.
 - Keep monitorcontrol operations inside the monitor context manager and clamp all public volume results/targets to `0`–`100`.
 - Preserve system key pass-through until a selected monitor has a successful volume read, and clear/pass through safely on loss of readiness.

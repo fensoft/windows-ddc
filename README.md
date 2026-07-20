@@ -14,19 +14,20 @@ It controls the monitor's DDC/CI audio-volume value, not the Windows audio mixer
 
 ![On-screen monitor volume overlay](docs/overlay.png)
 
-These manually maintained captures predate the wider serial-bearing monitor selector, Change speed selector, Start with Windows checkbox, and unavailable/error overlay. Update them only from a real application capture on compatible hardware.
+These manually maintained captures predate the wider serial-bearing monitor selector, Change speed selector, Start with Windows checkbox, descriptive volume buttons, live theme/scaling behavior, and unavailable/error overlay. Update them only from a real application capture on compatible hardware.
 
 ## Features
 
 - Discovers DDC/CI monitors and lets the user select one target.
 - Reads and writes the selected monitor's volume in the `0`–`100` range.
-- Provides a slider and `-`/`+` buttons with a persistent Slow, Medium, or Fast change speed.
+- Provides a slider and descriptive Decrease volume/Increase volume buttons with a persistent Slow, Medium, or Fast change speed.
 - Intercepts the global Windows Volume Down and Volume Up keys only while the native hook is live and a target is ready.
 - Shows volume and fail-closed monitor errors in a bottom-centered overlay on the cursor's DPI-scaled screen work area, falling back to the selected screen without taking focus.
 - Starts in the Windows notification area only after Windows confirms the icon was added, with live monitor/volume/routing status, Refresh, quick monitor switching, Restore, Exit, and Explorer-restart recovery.
 - Remembers the selected physical monitor by EDID manufacturer/product/serial when available, with a Windows device-path fallback.
 - Invalidates monitor control on Windows display/device notifications and reacquires fresh DDC handles before every actual write.
-- Follows the current user's Windows light/dark application preference at startup.
+- Reacts to Windows light/dark and High Contrast changes while running and reflows controls for the window's current DPI.
+- Supports full keyboard traversal, labeled access keys, refresh shortcuts, and explicit slider boundary/page navigation.
 - Keeps DDC/CI work off Tk's UI thread and coalesces rapid volume changes.
 - Fails closed on stalled DDC calls or internal UI callbacks, with bounded native-thread lifecycle waits.
 - Allows one instance per Windows session; launching it again restores the existing control window instead of starting competing hooks or DDC workers.
@@ -106,10 +107,12 @@ With no saved selection, the app selects automatically only when exactly one ver
 | Start | Acquires the session-local single-instance guard, creates display-change, tray, and keyboard-hook threads with two-second startup deadlines, waits up to two seconds for confirmed tray-icon addition before hiding, then discovers monitors in the background. A duplicate launch restores the existing window and exits. |
 | Restore | Double-click the tray icon or use **Restore**. The tray icon is hidden while the control window is visible. |
 | Select a monitor | Choose it in the read-only list. The stable identity is saved only after a successful volume read. |
-| Change volume | Choose a Slow (`+1`), Medium (`+2`), or Fast (`+3`) change speed, then use `-`, `+`, release the slider, or press Volume Down/Up. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
+| Change volume | Choose a Slow (`+1`), Medium (`+2`), or Fast (`+3`) change speed, then use **Decrease volume**, **Increase volume**, release the slider, or press Volume Down/Up. Slider `Home`/`End` select `0`/`100`; `Page Down`/`Page Up` change by `10`. Before each actual write, the app reacquires monitor wrappers and exact-matches the saved identity; writes are followed by a readback. |
+| Keyboard | Use `Tab`/`Shift+Tab` to traverse interactive controls. `Alt+M`, `Alt+V`, and `Alt+C` focus Monitor, Volume, and Change speed; `Alt+D`/`Alt+I` activate the volume buttons; `Alt+S` toggles Start with Windows; `Alt+R`, `Ctrl+R`, or `F5` refreshes; `Escape` minimizes to the tray. |
 | Start with Windows | Select the checkbox to write a current-user Run entry for the present source or executable path. Clear it to remove that entry. No administrator access is required. |
 | Tray menu | Right-click the icon to see the active monitor, last confirmed volume, and whether global volume-key routing is enabled. Use **Refresh**, choose a verified monitor for exact-match revalidation, or use **Restore**/**Exit**. |
 | Overlay | Volume and unavailable notices appear on the screen containing the cursor. If the cursor screen cannot be resolved, the selected monitor's display is used; taskbars, negative screen coordinates, and Windows display scaling are accounted for without activating the overlay. |
+| Theme and scaling | Windows theme, system-color, and High Contrast changes are applied without restarting. Control spacing and minimum width follow the current top-level window DPI, including after moving between differently scaled screens. |
 | Refresh | Re-enumerates monitors and reads the exact saved selection again. It never falls back to a different monitor. |
 | Minimize | Sends the control window to the notification area only after confirmed icon addition; failure restores the normal window. |
 | Close the restored window | Exits the application; it does not merely hide the window. |
@@ -121,7 +124,9 @@ The tray menu is built from a thread-safe immutable snapshot supplied by Tk. A m
 
 Overlay placement samples the cursor and Windows monitor bounds, work area, and scale factor each time the overlay appears, so cursor movement, a moved taskbar, or a changed display layout is reflected immediately. The cursor's screen is preferred, followed by the selected monitor's Windows display name and then the primary screen. This does not perform another DDC lookup. The window carries `WS_EX_NOACTIVATE` and is shown with `SWP_NOACTIVATE`; if that protection cannot be applied, the overlay remains hidden rather than risking a focus change.
 
-Change speed defaults to Slow (`+1`) when no valid preference is saved. Medium changes by `2` and Fast changes by `3`. The selected speed applies to both the on-screen `-`/`+` buttons and the global Volume Down/Up keys, updates the live hook immediately, and is saved in `settings.json`.
+Change speed defaults to Slow (`+1`) when no valid preference is saved. Medium changes by `2` and Fast changes by `3`. The selected speed applies to both the on-screen Decrease volume/Increase volume buttons and the global Volume Down/Up keys, updates the live hook immediately, and is saved in `settings.json`.
+
+Theme and system-color broadcasts are relayed from the native display-listener thread into Tk's queue and debounced before restyling. High Contrast suppresses custom dark colors in favor of Windows system colors and an opaque overlay. The control window reads its current HWND DPI and reapplies DPI-scaled spacing, slider length, and minimum width when it moves between screens.
 
 A DDC write and its readback are not transactional. If the write succeeds but readback fails, or if the display changes during an in-flight call, the monitor may already have changed. The application reports that uncertainty in the overlay and status bar, replaces the displayed value with `--`, releases global key interception, and performs read-only rediscovery without retrying the write. Volume changes are not rolled back when the application exits.
 
@@ -241,7 +246,7 @@ Choose another user-controlled backup location outside the checkout if Documents
 - There are no HTTP routes, ports, realtime sockets, external runtime services, accounts, authentication, or authorization roles.
 - The process loads native Windows libraries and installs a desktop-wide low-level keyboard hook. Unrelated keys are passed onward; Volume Down and Volume Up are swallowed only when the hook is live and the application's readiness flag is active. Each physical press keeps its initial consume/pass-through decision through the matching release.
 - DDC/CI writes cross the process boundary into physical monitor hardware and may have an audible effect.
-- The application reads the current user's Windows theme preference. It writes only its named current-user Run value, and only when the user toggles Start with Windows.
+- The application reads the current user's Windows theme, High Contrast state, system colors, and current window DPI. It writes only its named current-user Run value, and only when the user toggles Start with Windows.
 - Runtime settings contain no secrets. Do not add credentials or tokens to the tracked repository or the settings schema without an explicit security design.
 
 ## Build the executable
@@ -280,7 +285,7 @@ Install the editable runtime environment before developing:
 python -m pip install -e .
 ```
 
-The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, autostart command/registry behavior, diagnostics rotation, topology generations, fresh-handle revalidation, single-instance behavior, resilience, rich tray-menu snapshots/commands, multi-screen overlay placement/no-activate behavior, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, changes the live Run key, or contacts monitor hardware:
+The repository has a standard-library unit-test suite for hotkey safety, stable identity, isolated selection/change-speed settings, autostart command/registry behavior, diagnostics rotation, topology generations, fresh-handle revalidation, single-instance behavior, resilience, rich tray-menu snapshots/commands, multi-screen overlay placement/no-activate behavior, live theme/High Contrast behavior, keyboard accessibility, DPI scaling, CI safety, and tray recovery. It has no lint/type/format configuration. `.github/workflows/ci.yml` runs the following checks on `windows-latest` with Python 3.10 and 3.14 for pushes, pull requests, and manual dispatches. The workflow never launches the UI, executes the Nuitka build, installs native listeners, changes the live Run key, or contacts monitor hardware:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -306,7 +311,7 @@ if ($parseErrors.Count -ne 0) { $parseErrors; exit 1 }
 
 CI installs only the runtime project with `python -m pip install -e .`; it does not install the optional Nuitka build extra or publish artifacts. A workflow contract test keeps the supported Python boundary, low-risk commands, and prohibited hardware/runtime commands explicit.
 
-Changes to GUI, autostart, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, Start with Windows enable/disable and restart persistence, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay volume/errors on the cursor screen and selected-display fallback at mixed DPI without focus loss, key pass-through while invalid, hook/listener failure, rich tray status/Refresh/monitor switching, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change the current-user Run key, physical monitor volume, and user-session keyboard behavior.
+Changes to GUI, autostart, tray, hook, display notifications, or DDC behavior still require an authorized manual test on Windows with a compatible monitor. Back up live settings first. At minimum, verify primary startup, duplicate-launch restoration without a second process remaining, Start with Windows enable/disable and restart persistence, unique/no-serial/duplicate identity behavior, Change speed behavior and persistence, descriptive button names, `Tab`/`Shift+Tab` traversal and access keys, slider keyboard boundaries/pages, live light/dark/High Contrast transitions, moving the restored window between differently scaled screens, driver reset, resolution/orientation change, disconnect/reconnect, exact-match recovery, fresh writes/readback, rapid coalescing, overlay volume/errors on the cursor screen and selected-display fallback at mixed DPI without focus loss, key pass-through while invalid, hook/listener failure, rich tray status/Refresh/monitor switching, confirmed tray-first startup, failed icon-add fallback, minimize/restore, Explorer restart recovery, and clean exit. These tests can change the current-user Run key, physical monitor volume, and user-session keyboard behavior.
 
 For repository-specific maintainer rules, read [AGENTS.md](AGENTS.md).
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import ttk
 
@@ -9,7 +10,12 @@ try:
 except ImportError:
     winreg = None
 
-from windows_platform import get_toplevel_window_handle, set_window_dark_mode
+from windows_platform import (
+    get_toplevel_window_handle,
+    get_window_dpi,
+    is_high_contrast_enabled,
+    set_window_dark_mode,
+)
 
 
 PREFERRED_THEMES = ("vista", "xpnative", "winnative")
@@ -24,6 +30,17 @@ DARK_TEXT = "#F2F2F2"
 DARK_DISABLED_TEXT = "#8A8A8A"
 DARK_ACCENT = "#3A7BD5"
 DARK_STATUS_BG = "#191919"
+LIGHT_BG = "SystemButtonFace"
+LIGHT_TEXT = "SystemWindowText"
+LIGHT_LIST_BG = "SystemWindow"
+LIGHT_SELECTION_BG = "SystemHighlight"
+LIGHT_SELECTION_TEXT = "SystemHighlightText"
+
+
+@dataclass(frozen=True)
+class WindowsThemeState:
+    dark_mode: bool
+    high_contrast: bool
 
 
 def choose_preferred_theme(theme_names: tuple[str, ...] | list[str]) -> str | None:
@@ -47,6 +64,14 @@ def is_windows_dark_mode_enabled() -> bool:
     if value_type != winreg.REG_DWORD:
         return False
     return int(value) == 0
+
+
+def read_windows_theme_state() -> WindowsThemeState:
+    high_contrast = is_high_contrast_enabled()
+    return WindowsThemeState(
+        dark_mode=is_windows_dark_mode_enabled() and not high_contrast,
+        high_contrast=high_contrast,
+    )
 
 
 def ensure_dark_theme(style: ttk.Style) -> None:
@@ -134,8 +159,12 @@ def ensure_dark_theme(style: ttk.Style) -> None:
     )
 
 
-def apply_theme(style: ttk.Style, dark_mode: bool) -> str:
-    if dark_mode:
+def apply_theme(
+    style: ttk.Style,
+    dark_mode: bool,
+    high_contrast: bool = False,
+) -> str:
+    if dark_mode and not high_contrast:
         ensure_dark_theme(style)
         style.theme_use(DARK_THEME_NAME)
         return DARK_THEME_NAME
@@ -147,28 +176,51 @@ def apply_theme(style: ttk.Style, dark_mode: bool) -> str:
     return style.theme_use()
 
 
-def apply_color_scheme(root: tk.Tk, status_bar: tk.Label, dark_mode: bool) -> None:
-    if not dark_mode:
-        return
+def apply_color_scheme(
+    root: tk.Tk,
+    status_bar: tk.Label,
+    dark_mode: bool,
+    high_contrast: bool = False,
+) -> None:
+    if dark_mode and not high_contrast:
+        root_bg = DARK_BG
+        list_bg = DARK_SURFACE
+        text = DARK_TEXT
+        selection_bg = DARK_ACCENT
+        selection_text = DARK_TEXT
+        status_bg = DARK_STATUS_BG
+    else:
+        root_bg = LIGHT_BG
+        list_bg = LIGHT_LIST_BG
+        text = LIGHT_TEXT
+        selection_bg = LIGHT_SELECTION_BG
+        selection_text = LIGHT_SELECTION_TEXT
+        status_bg = LIGHT_BG
 
-    root.configure(bg=DARK_BG)
-    root.option_add("*TCombobox*Listbox.background", DARK_SURFACE)
-    root.option_add("*TCombobox*Listbox.foreground", DARK_TEXT)
-    root.option_add("*TCombobox*Listbox.selectBackground", DARK_ACCENT)
-    root.option_add("*TCombobox*Listbox.selectForeground", DARK_TEXT)
-    status_bar.configure(bg=DARK_STATUS_BG, fg=DARK_TEXT)
+    root.configure(bg=root_bg)
+    root.option_add("*TCombobox*Listbox.background", list_bg)
+    root.option_add("*TCombobox*Listbox.foreground", text)
+    root.option_add("*TCombobox*Listbox.selectBackground", selection_bg)
+    root.option_add("*TCombobox*Listbox.selectForeground", selection_text)
+    status_bar.configure(bg=status_bg, fg=text)
 
 
 def apply_window_chrome(root: tk.Tk, dark_mode: bool) -> None:
-    if not dark_mode:
-        return
-
     try:
         root.update_idletasks()
         hwnd = get_toplevel_window_handle(root.winfo_id())
     except tk.TclError:
         return
-    set_window_dark_mode(hwnd, True)
+    set_window_dark_mode(hwnd, dark_mode)
+
+
+def get_tk_window_dpi(root: tk.Tk) -> int:
+    try:
+        root.update_idletasks()
+        hwnd = get_toplevel_window_handle(root.winfo_id())
+    except tk.TclError:
+        return 96
+    return get_window_dpi(hwnd)
 
 
 def get_app_icon_path() -> Path | None:

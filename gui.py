@@ -39,7 +39,8 @@ from theme import (
     apply_color_scheme,
     apply_theme,
     apply_window_chrome,
-    is_windows_dark_mode_enabled,
+    get_tk_window_dpi,
+    read_windows_theme_state,
 )
 from windows_platform import (
     DisplayChangeListener,
@@ -75,6 +76,10 @@ class MonitorVolumeApp:
     DISPLAY_CHANGE_DEBOUNCE_MS = 500
     DDC_OPERATION_TIMEOUT_MS = 10_000
     REFRESH_RETRY_DELAYS_MS = (1000, 2000, 4000)
+    THEME_CHANGE_DEBOUNCE_MS = 100
+    BASE_WINDOW_MIN_WIDTH = 620
+    DECREASE_VOLUME_LABEL = "Decrease volume"
+    INCREASE_VOLUME_LABEL = "Increase volume"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -83,9 +88,16 @@ class MonitorVolumeApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Unmap>", self.on_window_unmap)
 
-        self.dark_mode = is_windows_dark_mode_enabled()
+        self.theme_state = read_windows_theme_state()
+        self.dark_mode = self.theme_state.dark_mode
+        self.high_contrast = self.theme_state.high_contrast
         self.style = ttk.Style(self.root)
-        self.active_theme = apply_theme(self.style, self.dark_mode)
+        self.active_theme = apply_theme(
+            self.style,
+            self.dark_mode,
+            self.high_contrast,
+        )
+        self._ui_dpi = get_tk_window_dpi(self.root)
 
         self.monitors: list[MonitorRef] = []
         self.preferred_selected_key = load_selected_monitor_key()
@@ -120,6 +132,8 @@ class MonitorVolumeApp:
         self._poll_after_id: str | None = None
         self._refresh_after_id: str | None = None
         self._ddc_timeout_after_id: str | None = None
+        self._theme_after_id: str | None = None
+        self._scale_after_id: str | None = None
         self._ddc_operation_sequence = 0
         self._active_ddc_operation_id: int | None = None
         self._active_ddc_operation_kind: str | None = None
@@ -141,10 +155,21 @@ class MonitorVolumeApp:
 
         self.app_icon_path = apply_app_icon(self.root)
         self._build_widgets()
-        self._overlay = VolumeOverlay(self.root)
-        apply_color_scheme(self.root, self.status_bar, self.dark_mode)
+        self._overlay = VolumeOverlay(
+            self.root,
+            dark_mode=self.dark_mode,
+            high_contrast=self.high_contrast,
+        )
+        apply_color_scheme(
+            self.root,
+            self.status_bar,
+            self.dark_mode,
+            self.high_contrast,
+        )
         self._lock_window_size()
         apply_window_chrome(self.root, self.dark_mode)
+        self._bind_keyboard_shortcuts()
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
         self._apply_control_state()
         self._start_display_listener()
         self._start_tray_icon()
@@ -160,91 +185,165 @@ class MonitorVolumeApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        content = ttk.Frame(self.root, padding=12)
-        content.grid(row=0, column=0, sticky="nsew")
-        content.columnconfigure(1, weight=1)
-        content.columnconfigure(2, weight=1)
+        self.content_frame = ttk.Frame(self.root, padding=self._scaled_px(12))
+        self.content_frame.grid(row=0, column=0, sticky="nsew")
+        self.content_frame.columnconfigure(1, weight=1)
+        self.content_frame.columnconfigure(2, weight=1)
 
-        ttk.Label(content, text="Monitor:").grid(row=0, column=0, sticky="w")
+        self.monitor_label = ttk.Label(self.content_frame, text="Monitor:", underline=0)
+        self.monitor_label.grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
 
         self.monitor_combo = ttk.Combobox(
-            content,
+            self.content_frame,
             textvariable=self.monitor_var,
             state="readonly",
             width=44,
+            takefocus=True,
         )
-        self.monitor_combo.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        self.monitor_combo.grid(
+            row=1,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(self._scaled_px(4), 0),
+        )
         self.monitor_combo.bind("<<ComboboxSelected>>", self.on_monitor_selected)
 
-        self.refresh_button = ttk.Button(content, text="Refresh", width=10, command=self.refresh_monitors)
-        self.refresh_button.grid(row=1, column=3, sticky="e", padx=(8, 0), pady=(4, 0))
+        self.refresh_button = ttk.Button(
+            self.content_frame,
+            text="Refresh",
+            underline=0,
+            width=10,
+            takefocus=True,
+            command=self.refresh_monitors,
+        )
+        self.refresh_button.grid(
+            row=1,
+            column=3,
+            sticky="e",
+            padx=(self._scaled_px(8), 0),
+            pady=(self._scaled_px(4), 0),
+        )
 
-        ttk.Label(content, text="Volume:").grid(row=2, column=0, sticky="w", pady=(14, 0))
+        self.volume_label = ttk.Label(self.content_frame, text="Volume:", underline=0)
+        self.volume_label.grid(
+            row=2,
+            column=0,
+            sticky="w",
+            pady=(self._scaled_px(14), 0),
+        )
 
-        ttk.Label(content, text="Change speed:").grid(
+        self.change_speed_label = ttk.Label(
+            self.content_frame,
+            text="Change speed:",
+            underline=0,
+        )
+        self.change_speed_label.grid(
             row=2,
             column=1,
             sticky="e",
-            pady=(14, 0),
+            pady=(self._scaled_px(14), 0),
         )
 
         self.change_speed_combo = ttk.Combobox(
-            content,
+            self.content_frame,
             textvariable=self.change_speed_var,
             values=tuple(speed.title() for speed in self.CHANGE_SPEED_STEPS),
             state="readonly",
             width=8,
+            takefocus=True,
         )
         self.change_speed_combo.grid(
             row=2,
             column=2,
             sticky="w",
-            padx=(4, 8),
-            pady=(14, 0),
+            padx=(self._scaled_px(4), self._scaled_px(8)),
+            pady=(self._scaled_px(14), 0),
         )
         self.change_speed_combo.bind("<<ComboboxSelected>>", self.on_change_speed_selected)
 
         self.volume_value_label = ttk.Label(
-            content,
+            self.content_frame,
             textvariable=self.volume_text_var,
             width=5,
             anchor="e",
         )
-        self.volume_value_label.grid(row=2, column=3, sticky="e", pady=(14, 0))
+        self.volume_value_label.grid(
+            row=2,
+            column=3,
+            sticky="e",
+            pady=(self._scaled_px(14), 0),
+        )
 
         self.decrease_button = ttk.Button(
-            content,
-            text="-",
-            width=4,
+            self.content_frame,
+            text=self.DECREASE_VOLUME_LABEL,
+            underline=0,
+            takefocus=True,
             command=lambda: self.adjust_selected_volume(-self.volume_step),
         )
-        self.decrease_button.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.decrease_button.grid(
+            row=3,
+            column=0,
+            sticky="w",
+            pady=(self._scaled_px(6), 0),
+        )
 
         self.volume_scale = ttk.Scale(
-            content,
+            self.content_frame,
             from_=0,
             to=100,
             orient=tk.HORIZONTAL,
             variable=self.volume_var,
             command=self.on_scale_moved,
-            length=260,
+            length=self._scaled_px(260),
+            takefocus=True,
         )
-        self.volume_scale.grid(row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=(6, 0))
+        self.volume_scale.grid(
+            row=3,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            padx=self._scaled_px(8),
+            pady=(self._scaled_px(6), 0),
+        )
         self.volume_scale.bind("<ButtonRelease-1>", self.on_scale_released)
-        self.volume_scale.bind("<KeyRelease>", self.on_scale_released)
+        for sequence in (
+            "<KeyRelease-Left>",
+            "<KeyRelease-Right>",
+            "<KeyRelease-Up>",
+            "<KeyRelease-Down>",
+        ):
+            self.volume_scale.bind(sequence, self.on_scale_released)
+        self.volume_scale.bind("<Home>", lambda _event: self._set_volume_from_keyboard(0))
+        self.volume_scale.bind("<End>", lambda _event: self._set_volume_from_keyboard(100))
+        self.volume_scale.bind("<Prior>", lambda _event: self._adjust_volume_from_keyboard(10))
+        self.volume_scale.bind("<Next>", lambda _event: self._adjust_volume_from_keyboard(-10))
 
         self.increase_button = ttk.Button(
-            content,
-            text="+",
-            width=4,
+            self.content_frame,
+            text=self.INCREASE_VOLUME_LABEL,
+            underline=0,
+            takefocus=True,
             command=lambda: self.adjust_selected_volume(self.volume_step),
         )
-        self.increase_button.grid(row=3, column=3, sticky="e", pady=(6, 0))
+        self.increase_button.grid(
+            row=3,
+            column=3,
+            sticky="e",
+            pady=(self._scaled_px(6), 0),
+        )
 
         self.start_with_windows_check = ttk.Checkbutton(
-            content,
+            self.content_frame,
             text="Start with Windows",
+            underline=0,
             variable=self.start_with_windows_var,
+            takefocus=True,
             command=self.on_start_with_windows_toggled,
         )
         self.start_with_windows_check.grid(
@@ -252,7 +351,7 @@ class MonitorVolumeApp:
             column=0,
             columnspan=4,
             sticky="w",
-            pady=(12, 0),
+            pady=(self._scaled_px(12), 0),
         )
 
         self.status_bar = tk.Label(
@@ -261,21 +360,120 @@ class MonitorVolumeApp:
             anchor="w",
             relief=tk.SUNKEN,
             bd=1,
-            padx=6,
+            padx=self._scaled_px(6),
         )
         self.status_bar.grid(row=1, column=0, sticky="ew")
 
+    def _scaled_px(self, value: int) -> int:
+        return max(1, round(value * self._ui_dpi / 96))
+
+    def _apply_scaled_layout(self) -> None:
+        self.content_frame.configure(padding=self._scaled_px(12))
+        self.monitor_combo.grid_configure(pady=(self._scaled_px(4), 0))
+        self.refresh_button.grid_configure(
+            padx=(self._scaled_px(8), 0),
+            pady=(self._scaled_px(4), 0),
+        )
+        self.volume_label.grid_configure(pady=(self._scaled_px(14), 0))
+        self.change_speed_label.grid_configure(pady=(self._scaled_px(14), 0))
+        self.change_speed_combo.grid_configure(
+            padx=(self._scaled_px(4), self._scaled_px(8)),
+            pady=(self._scaled_px(14), 0),
+        )
+        self.volume_value_label.grid_configure(pady=(self._scaled_px(14), 0))
+        self.decrease_button.grid_configure(pady=(self._scaled_px(6), 0))
+        self.volume_scale.configure(length=self._scaled_px(260))
+        self.volume_scale.grid_configure(
+            padx=self._scaled_px(8),
+            pady=(self._scaled_px(6), 0),
+        )
+        self.increase_button.grid_configure(pady=(self._scaled_px(6), 0))
+        self.start_with_windows_check.grid_configure(pady=(self._scaled_px(12), 0))
+        self.status_bar.configure(padx=self._scaled_px(6))
+
     def _lock_window_size(self) -> None:
+        self._apply_scaled_layout()
+        self._resize_for_content(force=True)
+        self.root.resizable(True, False)
+
+    def _resize_for_content(self, force: bool = False) -> None:
         self.root.update_idletasks()
-        width = max(self.root.winfo_reqwidth(), 520)
+        width = max(self.root.winfo_reqwidth(), self._scaled_px(self.BASE_WINDOW_MIN_WIDTH))
         height = self.root.winfo_reqheight()
-        self.root.geometry(f"{width}x{height}")
-        self.root.resizable(False, False)
+        self.root.minsize(width, height)
+        current_width = self.root.winfo_width()
+        current_height = self.root.winfo_height()
+        if force or current_width < width or current_height != height:
+            self.root.geometry(f"{width if force else max(current_width, width)}x{height}")
+
+    def _on_root_configure(self, event: Any) -> None:
+        if self._closing or event.widget is not self.root or self._scale_after_id is not None:
+            return
+        self._scale_after_id = self.root.after_idle(self._refresh_ui_scaling)
+
+    def _refresh_ui_scaling(self) -> None:
+        self._scale_after_id = None
+        if self._closing:
+            return
+        dpi = get_tk_window_dpi(self.root)
+        if dpi == self._ui_dpi:
+            return
+        self._ui_dpi = dpi
+        self._apply_scaled_layout()
+        self._resize_for_content()
+
+    def _bind_keyboard_shortcuts(self) -> None:
+        bindings = {
+            "<Alt-m>": lambda _event: self._focus_control(self.monitor_combo),
+            "<Alt-v>": lambda _event: self._focus_control(self.volume_scale),
+            "<Alt-c>": lambda _event: self._focus_control(self.change_speed_combo),
+            "<Alt-r>": lambda _event: self._invoke_control(self.refresh_button),
+            "<Control-r>": lambda _event: self._invoke_control(self.refresh_button),
+            "<F5>": lambda _event: self._invoke_control(self.refresh_button),
+            "<Alt-d>": lambda _event: self._invoke_control(self.decrease_button),
+            "<Alt-i>": lambda _event: self._invoke_control(self.increase_button),
+            "<Alt-s>": lambda _event: self._invoke_control(self.start_with_windows_check),
+            "<Escape>": self._minimize_from_keyboard,
+        }
+        for sequence, callback in bindings.items():
+            self.root.bind(sequence, callback)
+
+    @staticmethod
+    def _focus_control(widget: Any) -> str:
+        if widget.instate(["!disabled"]):
+            widget.focus_set()
+        return "break"
+
+    @staticmethod
+    def _invoke_control(widget: Any) -> str:
+        if widget.instate(["!disabled"]):
+            widget.invoke()
+        return "break"
+
+    def _minimize_from_keyboard(self, _event: Any = None) -> str:
+        self.minimize_to_tray()
+        return "break"
+
+    def _set_volume_from_keyboard(self, volume: int) -> str:
+        if not self._control_ready() or (self._busy and not self._volume_write_inflight):
+            self._show_unavailable_error()
+            return "break"
+        target_volume = clamp(volume, 0, 100)
+        if target_volume == self._current_target_volume():
+            self._show_volume_overlay(target_volume)
+        else:
+            self._request_volume_target(target_volume)
+        return "break"
+
+    def _adjust_volume_from_keyboard(self, delta: int) -> str:
+        self.adjust_selected_volume(delta)
+        return "break"
 
     def _start_display_listener(self) -> None:
         self._display_listener = DisplayChangeListener(
             on_change=self._handle_display_change_from_thread,
             on_error=self._handle_display_listener_error_from_thread,
+            on_theme_change=self._handle_theme_change_from_thread,
         )
         try:
             self._display_listener.start()
@@ -369,6 +567,43 @@ class MonitorVolumeApp:
     def _handle_display_change_from_thread(self) -> None:
         self._invalidate_topology_generation()
         self._post_to_ui(self._handle_display_change)
+
+    def _handle_theme_change_from_thread(self) -> None:
+        self._post_to_ui(self._schedule_theme_refresh)
+
+    def _schedule_theme_refresh(self) -> None:
+        if self._closing:
+            return
+        if self._theme_after_id is not None:
+            self.root.after_cancel(self._theme_after_id)
+        self._theme_after_id = self.root.after(
+            self.THEME_CHANGE_DEBOUNCE_MS,
+            self._apply_live_theme,
+        )
+
+    def _apply_live_theme(self) -> None:
+        self._theme_after_id = None
+        if self._closing:
+            return
+        self.theme_state = read_windows_theme_state()
+        self.dark_mode = self.theme_state.dark_mode
+        self.high_contrast = self.theme_state.high_contrast
+        self.active_theme = apply_theme(
+            self.style,
+            self.dark_mode,
+            self.high_contrast,
+        )
+        apply_color_scheme(
+            self.root,
+            self.status_bar,
+            self.dark_mode,
+            self.high_contrast,
+        )
+        if self._overlay is not None:
+            self._overlay.apply_theme(self.dark_mode, self.high_contrast)
+        apply_window_chrome(self.root, self.dark_mode)
+        self._apply_scaled_layout()
+        self._resize_for_content()
 
     def _handle_display_listener_error_from_thread(self, exc: Exception) -> None:
         self._invalidate_topology_generation()
@@ -1292,6 +1527,12 @@ class MonitorVolumeApp:
         if self._ddc_timeout_after_id is not None:
             self.root.after_cancel(self._ddc_timeout_after_id)
             self._ddc_timeout_after_id = None
+        if self._theme_after_id is not None:
+            self.root.after_cancel(self._theme_after_id)
+            self._theme_after_id = None
+        if self._scale_after_id is not None:
+            self.root.after_cancel(self._scale_after_id)
+            self._scale_after_id = None
         shutdown_failures: list[str] = []
         if self._listener is not None:
             self._stop_native_controller("Volume-key listener", self._listener, shutdown_failures)

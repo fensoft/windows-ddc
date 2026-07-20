@@ -15,10 +15,13 @@ WH_KEYBOARD_LL = 13
 CS_DBLCLKS = 0x0008
 WM_NULL = 0x0000
 WM_DESTROY = 0x0002
+WM_SETTINGCHANGE = 0x001A
+WM_SYSCOLORCHANGE = 0x0015
 WM_COMMAND = 0x0111
 WM_CONTEXTMENU = 0x007B
 WM_DISPLAYCHANGE = 0x007E
 WM_DEVICECHANGE = 0x0219
+WM_THEMECHANGED = 0x031A
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_LBUTTONDBLCLK = 0x0203
@@ -65,6 +68,9 @@ SWP_SHOWWINDOW = 0x0040
 SWP_NOOWNERZORDER = 0x0200
 HWND_TOPMOST = -1
 DEFAULT_DISPLAY_SCALE_PERCENT = 100
+USER_DEFAULT_SCREEN_DPI = 96
+SPI_GETHIGHCONTRAST = 0x0042
+HCF_HIGHCONTRASTON = 0x00000001
 SM_CXSMICON = 49
 SM_CYSMICON = 50
 GA_ROOT = 2
@@ -182,6 +188,14 @@ class MONITORINFOEXW(ctypes.Structure):
         ("rcWork", wintypes.RECT),
         ("dwFlags", wintypes.DWORD),
         ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+class HIGHCONTRASTW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("dwFlags", wintypes.DWORD),
+        ("lpszDefaultScheme", wintypes.LPWSTR),
     ]
 
 
@@ -356,6 +370,8 @@ user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
+user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+user32.GetDpiForWindow.restype = wintypes.UINT
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowLongW.restype = ctypes.c_long
 user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
@@ -370,6 +386,13 @@ user32.SetWindowPos.argtypes = [
     wintypes.UINT,
 ]
 user32.SetWindowPos.restype = wintypes.BOOL
+user32.SystemParametersInfoW.argtypes = [
+    wintypes.UINT,
+    wintypes.UINT,
+    LPVOID,
+    wintypes.UINT,
+]
+user32.SystemParametersInfoW.restype = wintypes.BOOL
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
@@ -754,6 +777,28 @@ def get_toplevel_window_handle(hwnd: int) -> int:
     return int(hwnd)
 
 
+def get_window_dpi(hwnd: int) -> int:
+    if not hwnd:
+        return USER_DEFAULT_SCREEN_DPI
+    dpi = int(user32.GetDpiForWindow(wintypes.HWND(hwnd)))
+    if dpi <= 0:
+        return USER_DEFAULT_SCREEN_DPI
+    return dpi
+
+
+def is_high_contrast_enabled() -> bool:
+    high_contrast = HIGHCONTRASTW()
+    high_contrast.cbSize = ctypes.sizeof(high_contrast)
+    if not user32.SystemParametersInfoW(
+        SPI_GETHIGHCONTRAST,
+        ctypes.sizeof(high_contrast),
+        ctypes.byref(high_contrast),
+        0,
+    ):
+        return False
+    return bool(high_contrast.dwFlags & HCF_HIGHCONTRASTON)
+
+
 def _monitor_scale_percent(hmonitor: wintypes.HANDLE) -> int:
     if shcore is None:
         return DEFAULT_DISPLAY_SCALE_PERCENT
@@ -933,9 +978,11 @@ class DisplayChangeListener:
         self,
         on_change: Callable[[], None],
         on_error: Callable[[Exception], None],
+        on_theme_change: Callable[[], None] | None = None,
     ) -> None:
         self.on_change = on_change
         self.on_error = on_error
+        self.on_theme_change = on_theme_change or (lambda: None)
         self._instance = kernel32.GetModuleHandleW(None)
         self._class_name = f"MonitorVolumeDisplayListener_{os.getpid()}_{id(self)}"
         self._wndproc = WNDPROC(self._window_proc)
@@ -1075,6 +1122,12 @@ class DisplayChangeListener:
         ):
             try:
                 self.on_change()
+            except Exception as exc:
+                self.on_error(exc)
+            return 0
+        if msg in (WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED):
+            try:
+                self.on_theme_change()
             except Exception as exc:
                 self.on_error(exc)
             return 0

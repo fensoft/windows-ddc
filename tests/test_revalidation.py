@@ -10,6 +10,9 @@ from windows_platform import (
     DBT_DEVNODES_CHANGED,
     WM_DEVICECHANGE,
     WM_DISPLAYCHANGE,
+    WM_SETTINGCHANGE,
+    WM_SYSCOLORCHANGE,
+    WM_THEMECHANGED,
     DisplayChangeListener,
 )
 
@@ -223,6 +226,19 @@ class DisplayChangeListenerTests(unittest.TestCase):
             0,
         )
         self.assertEqual(changes, ["changed", "changed"])
+
+    def test_theme_and_system_color_messages_use_the_theme_callback(self) -> None:
+        changes: list[str] = []
+        listener = DisplayChangeListener(
+            on_change=lambda: changes.append("display"),
+            on_error=lambda _error: None,
+            on_theme_change=lambda: changes.append("theme"),
+        )
+
+        for message in (WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED):
+            self.assertEqual(listener._window_proc(0, message, 0, 0), 0)
+
+        self.assertEqual(changes, ["theme", "theme", "theme"])
 
 
 if __name__ == "__main__":

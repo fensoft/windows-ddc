@@ -8,6 +8,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 
 ### Added
 
+- Added keyboard mnemonics, refresh shortcuts, slider boundary/page navigation, focusable controls, and descriptive volume button labels.
 - Added release-history, architecture, and repository-agent documentation.
 - Added hardware-free unit coverage for hook liveness, readiness loss, write failures, shutdown, and paired volume-key events.
 - Added EDID/device-path monitor identity, display/device change notifications, error overlays, and hardware-free identity/settings/revalidation coverage.
@@ -22,6 +23,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 
 ### Changed
 
+- Apply Windows light/dark, system-color, and High Contrast changes live, and reflow the control window at its current DPI.
 - Expanded user and operator documentation without changing runtime behavior.
 - Place the volume/error overlay on the cursor's DPI-scaled Windows work area, fall back to the selected display when needed, and enforce native no-activate presentation.
 - Made global Volume Down/Up interception require a live native hook and release subsequent presses after an uncertain DDC write result until Refresh succeeds.
