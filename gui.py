@@ -620,13 +620,27 @@ class MonitorVolumeApp:
         if volume is None:
             volume = self.current_volume
         if volume is not None:
-            self._overlay.show(clamp(volume, 0, 100))
+            self._overlay.show(
+                clamp(volume, 0, 100),
+                preferred_display_device_name=self._selected_display_device_name(),
+            )
 
     def _show_unavailable_error(self, message: str | None = None) -> None:
         reason = message or self._control_unavailable_reason or "Selected monitor is unavailable."
         self._set_status(reason)
         if not self._closing and self._overlay is not None:
-            self._overlay.show_error(reason)
+            self._overlay.show_error(
+                reason,
+                preferred_display_device_name=self._selected_display_device_name(),
+            )
+
+    def _selected_display_device_name(self) -> str | None:
+        if self.selected_key is None:
+            return None
+        for monitor_ref in self.monitors:
+            if monitor_ref.selection_key == self.selected_key:
+                return monitor_ref.display_device_name
+        return None
 
     def _selected_monitor(self) -> MonitorRef | None:
         current_index = self.monitor_combo.current()

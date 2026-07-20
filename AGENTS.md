@@ -9,7 +9,7 @@ These instructions apply to the entire repository. Keep this file operational an
 - Runtime dependency: `monitorcontrol==4.2.0`. Optional executable builder: `Nuitka==2.4.8`.
 - The app is an interactive current-user process, not a service. It has no HTTP/API server, port, database, authentication, external broker/job queue, cron, telemetry, or runtime network client.
 - The global Volume Down/Up hook and physical DDC writes are safety-sensitive. Do not launch the app or call monitor operations as routine automated validation.
-- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, autostart command/registry behavior, rotating diagnostics, display invalidation, fresh-handle revalidation, single-instance behavior, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
+- There is a standard-library unit-test suite for fail-safe hotkeys, stable identity/settings, Change speed persistence, autostart command/registry behavior, rotating diagnostics, display invalidation, fresh-handle revalidation, single-instance behavior, multi-screen overlay placement/focus safety, resilience, CI safety, and tray recovery. GitHub Actions runs the hardware-free suite and low-risk checks on Windows for Python 3.10 and 3.14. There is no lint, format, type-check, or third-party test-framework configuration. State those limitations accurately.
 
 ## Runtime Shape
 
@@ -32,13 +32,13 @@ Always preserve Tk's thread affinity. Never call Tk methods from tray, hook, or 
 | `autostart.py` | Current-user Run-key state and quoted source/packaged launch commands. |
 | `diagnostics.py` | Nonfatal per-user rotating-log configuration and component logger access. |
 | `main.py` | Unsupported launcher stub; prints migration guidance and returns `1`. |
-| `gui.py` | UI state machine, selection, readiness, queues, worker serialization, tray snapshots/actions, and window lifecycle. |
+| `gui.py` | UI state machine, selection, readiness, queues, worker serialization, overlay targeting, tray snapshots/actions, and window lifecycle. |
 | `ddc.py` | Monitor identity, enumeration, clamping, and DDC read/write wrappers. |
 | `settings.py` | Per-user selected-monitor and Change speed JSON load/save. |
-| `overlay.py` | Topmost, auto-hiding volume `Toplevel`. |
+| `overlay.py` | Work-area/DPI-aware, no-activate, topmost, auto-hiding volume `Toplevel`. |
 | `theme.py` | Windows theme read, ttk styles, DWM chrome, and runtime icon path. |
-| `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display notifications, snapshot-driven tray controller, global keyboard hook, and DWM helpers. |
-| `tests/` | Hardware-free hotkey, identity, settings, autostart, single-instance, topology-generation, fresh-write, resilience, and tray-recovery regressions. |
+| `windows_platform.py` | Win32 ctypes ABI, single-instance mutex/restore signaling, monitor identity/EDID inventory, display work areas/scaling, no-activate overlay helpers, display notifications, snapshot-driven tray controller, global keyboard hook, and DWM helpers. |
+| `tests/` | Hardware-free hotkey, identity, settings, autostart, single-instance, topology-generation, fresh-write, overlay, resilience, and tray-recovery regressions. |
 | `.github/workflows/ci.yml` | Windows Python 3.10/3.14 hardware-free unit and low-risk validation workflow. |
 | `pyproject.toml` | Python requirement, dependency pins, and installed flat modules. |
 | `build_exe.ps1` | One-file Nuitka build for `dist\windows-ddc.exe`. |
@@ -137,7 +137,7 @@ GUI, tray, hook, theme, or DDC changes require an authorized Windows/manual pass
 - Start with Windows enable/disable, checkbox persistence, source command, packaged command after an authorized build, and moved-target behavior;
 - key pass-through before readiness and after exit;
 - rapid-write coalescing and `0`/`100` boundaries;
-- overlay visibility and auto-hide;
+- overlay visibility, auto-hide, cursor-screen/selected-display-fallback placement, mixed-DPI work areas, and focus preservation;
 - minimize, restore, Refresh, and clean shutdown;
 - confirmed icon addition, failed-add fallback, and Explorer `TaskbarCreated` recovery;
 - rich tray active-monitor/confirmed-volume/routing state, Refresh, stable-identity switching, Restore, and Exit;
@@ -160,6 +160,7 @@ Manual DDC tests can be audible and mutate monitor state. Record what was actual
 - Display/device notifications trigger debounced discovery with bounded retries; every actual write also reacquires monitor wrappers. Do not claim that external OSD/program volume changes are polled.
 - Preserve the acknowledged tray-show handshake: never withdraw Tk until the tray thread confirms `Shell_NotifyIconW` success. Tray errors must keep or restore the main window, and a `TaskbarCreated` broadcast must re-add an icon that was intended to be visible.
 - Preserve immutable lock-protected tray snapshots and dispatch monitor command IDs against the snapshot that built the open menu. Never call Tk from the tray thread; Refresh and stable-identity monitor switching must enqueue through `_post_to_ui()`.
+- Preserve cursor-screen-first overlay placement with selected-display fallback, current `rcWork`/scale lookup, negative-coordinate handling, and clamping. Never show the overlay unless `WS_EX_NOACTIVATE` is applied, and keep native presentation on `SWP_NOACTIVATE` without Tk focus/lift calls.
 - Preserve the session-local named mutex before Tk initialization and retain its handle through main-loop exit. Duplicate launch must not read settings or initialize hooks, tray state, or DDC workers; its restore broadcast is best-effort.
 - Configure logging only after acquiring the session mutex so duplicate processes never contend for rotation. Logging setup must remain nonfatal, bounded, and free of deliberate monitor identity or secret fields.
 - Preserve autostart as an explicit current-user checkbox. Keep registry failures nonfatal, quote source/executable paths, reject commands beyond 260 characters, prefer `pythonw.exe` for source, and use `sys.argv[0]` for Nuitka one-file builds so temporary extraction paths are never registered.

@@ -23,6 +23,7 @@ That audited history contains one parentless commit. The audit clone had no loca
 ### Changed
 
 - Expanded user and operator documentation without changing runtime behavior.
+- Place the volume/error overlay on the cursor's DPI-scaled Windows work area, fall back to the selected display when needed, and enforce native no-activate presentation.
 - Made global Volume Down/Up interception require a live native hook and release subsequent presses after an uncertain DDC write result until Refresh succeeds.
 - Kept the consume/pass-through decision stable from the first key-down through the matching key-up.
 - Replaced description/ordinal persistence with backward-compatible schema-version-2 stable identity matching; missing or ambiguous targets now fail closed instead of selecting another monitor.

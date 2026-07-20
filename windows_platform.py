@@ -52,6 +52,19 @@ MF_CHECKED = 0x00000008
 MF_SEPARATOR = 0x00000800
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
+MONITORINFOF_PRIMARY = 0x00000001
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
+SWP_NOOWNERZORDER = 0x0200
+HWND_TOPMOST = -1
+DEFAULT_DISPLAY_SCALE_PERCENT = 100
 SM_CXSMICON = 49
 SM_CYSMICON = 50
 GA_ROOT = 2
@@ -209,6 +222,31 @@ class WindowsMonitorIdentity:
     serial_number: str | None = None
 
 
+@dataclass(frozen=True)
+class ScreenRect:
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return max(0, self.right - self.left)
+
+    @property
+    def height(self) -> int:
+        return max(0, self.bottom - self.top)
+
+
+@dataclass(frozen=True)
+class DisplayArea:
+    display_device_name: str
+    bounds: ScreenRect
+    work_area: ScreenRect
+    scale_percent: int = DEFAULT_DISPLAY_SCALE_PERCENT
+    primary: bool = False
+
+
 class PlatformError(RuntimeError):
     pass
 
@@ -223,6 +261,10 @@ shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
 setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+try:
+    shcore = ctypes.WinDLL("shcore", use_last_error=True)
+except OSError:
+    shcore = None
 try:
     dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 except OSError:
@@ -314,6 +356,20 @@ user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
+user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+user32.SetWindowLongW.restype = ctypes.c_long
+user32.SetWindowPos.argtypes = [
+    wintypes.HWND,
+    wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.UINT,
+]
+user32.SetWindowPos.restype = wintypes.BOOL
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
@@ -393,6 +449,12 @@ advapi32.RegQueryValueExW.argtypes = [
 advapi32.RegQueryValueExW.restype = wintypes.LONG
 advapi32.RegCloseKey.argtypes = [wintypes.HANDLE]
 advapi32.RegCloseKey.restype = wintypes.LONG
+if shcore is not None:
+    shcore.GetScaleFactorForMonitor.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    shcore.GetScaleFactorForMonitor.restype = HRESULT
 if dwmapi is not None:
     dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, LPVOID, wintypes.DWORD]
     dwmapi.DwmSetWindowAttribute.restype = HRESULT
@@ -690,6 +752,177 @@ def get_toplevel_window_handle(hwnd: int) -> int:
     if top_level_hwnd:
         return int(top_level_hwnd)
     return int(hwnd)
+
+
+def _monitor_scale_percent(hmonitor: wintypes.HANDLE) -> int:
+    if shcore is None:
+        return DEFAULT_DISPLAY_SCALE_PERCENT
+
+    scale_percent = ctypes.c_int(DEFAULT_DISPLAY_SCALE_PERCENT)
+    result = shcore.GetScaleFactorForMonitor(hmonitor, ctypes.byref(scale_percent))
+    if result != 0 or not 100 <= scale_percent.value <= 500:
+        return DEFAULT_DISPLAY_SCALE_PERCENT
+    return scale_percent.value
+
+
+def enumerate_display_areas() -> list[DisplayArea]:
+    display_areas: list[DisplayArea] = []
+    callback_failed = False
+
+    def callback(
+        hmonitor: wintypes.HANDLE,
+        _hdc: wintypes.HDC,
+        _rect: ctypes.POINTER(wintypes.RECT),
+        _data: wintypes.LPARAM,
+    ) -> bool:
+        nonlocal callback_failed
+        try:
+            monitor_info = MONITORINFOEXW()
+            monitor_info.cbSize = ctypes.sizeof(monitor_info)
+            if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(monitor_info)):
+                return True
+
+            bounds = ScreenRect(
+                monitor_info.rcMonitor.left,
+                monitor_info.rcMonitor.top,
+                monitor_info.rcMonitor.right,
+                monitor_info.rcMonitor.bottom,
+            )
+            work_area = ScreenRect(
+                monitor_info.rcWork.left,
+                monitor_info.rcWork.top,
+                monitor_info.rcWork.right,
+                monitor_info.rcWork.bottom,
+            )
+            if bounds.width <= 0 or bounds.height <= 0:
+                return True
+            if work_area.width <= 0 or work_area.height <= 0:
+                work_area = bounds
+            display_areas.append(
+                DisplayArea(
+                    display_device_name=monitor_info.szDevice,
+                    bounds=bounds,
+                    work_area=work_area,
+                    scale_percent=_monitor_scale_percent(hmonitor),
+                    primary=bool(monitor_info.dwFlags & MONITORINFOF_PRIMARY),
+                )
+            )
+        except Exception:
+            callback_failed = True
+            return False
+        return True
+
+    monitor_callback = MONITORENUMPROC(callback)
+    if not user32.EnumDisplayMonitors(None, None, monitor_callback, 0):
+        return []
+    if callback_failed:
+        return []
+    return display_areas
+
+
+def select_display_area(
+    display_areas: list[DisplayArea] | tuple[DisplayArea, ...],
+    preferred_display_device_name: str | None,
+    cursor_position: tuple[int, int] | None,
+) -> DisplayArea | None:
+    if not display_areas:
+        return None
+
+    if cursor_position is not None:
+        cursor_x, cursor_y = cursor_position
+        for display_area in display_areas:
+            bounds = display_area.bounds
+            if (
+                bounds.left <= cursor_x < bounds.right
+                and bounds.top <= cursor_y < bounds.bottom
+            ):
+                return display_area
+
+    if preferred_display_device_name:
+        preferred_name = preferred_display_device_name.casefold()
+        for display_area in display_areas:
+            if display_area.display_device_name.casefold() == preferred_name:
+                return display_area
+
+    for display_area in display_areas:
+        if display_area.primary:
+            return display_area
+    return display_areas[0]
+
+
+def get_overlay_display_area(
+    preferred_display_device_name: str | None = None,
+) -> DisplayArea | None:
+    display_areas = enumerate_display_areas()
+    if not display_areas:
+        return None
+
+    cursor_position = None
+    point = wintypes.POINT()
+    if user32.GetCursorPos(ctypes.byref(point)):
+        cursor_position = point.x, point.y
+
+    return select_display_area(
+        display_areas,
+        preferred_display_device_name,
+        cursor_position,
+    )
+
+
+def configure_no_activate_window(hwnd: int) -> bool:
+    if not hwnd:
+        return False
+
+    native_hwnd = wintypes.HWND(hwnd)
+    ctypes.set_last_error(0)
+    current_style = user32.GetWindowLongW(native_hwnd, GWL_EXSTYLE)
+    if current_style == 0 and ctypes.get_last_error() != 0:
+        return False
+
+    desired_style = current_style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+    if desired_style != current_style:
+        ctypes.set_last_error(0)
+        previous_style = user32.SetWindowLongW(native_hwnd, GWL_EXSTYLE, desired_style)
+        if previous_style == 0 and ctypes.get_last_error() != 0:
+            return False
+
+    return bool(
+        user32.SetWindowPos(
+            native_hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOZORDER
+            | SWP_NOACTIVATE
+            | SWP_FRAMECHANGED,
+        )
+    )
+
+
+def show_window_no_activate(
+    hwnd: int,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> bool:
+    if not hwnd or width <= 0 or height <= 0:
+        return False
+    return bool(
+        user32.SetWindowPos(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(HWND_TOPMOST),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER,
+        )
+    )
 
 
 class DisplayChangeListener:
